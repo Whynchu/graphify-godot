@@ -33,7 +33,7 @@ _LANG_FAMILY: dict[str, str] = {
     **{e: "python" for e in (".py", ".pyw")},
     **{e: "js" for e in (".js", ".jsx", ".mjs", ".cjs", ".ejs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte")},
     **{e: "go" for e in (".go",)},
-    **{e: "gdscript" for e in (".gd", ".tres", ".tscn")},
+    **{e: "gdscript" for e in (".gd", ".tres", ".tscn", ".godot")},
     **{e: "rust" for e in (".rs",)},
     **{e: "jvm" for e in (".java", ".kt", ".kts", ".scala")},
     **{e: "c" for e in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp")},

@@ -284,7 +284,12 @@ Codex users also need `multi_agent = true` under `[features]` in `~/.codex/confi
 | `bedrock` | AWS Bedrock (uses IAM, no API key) | `uv tool install "graphifyy[bedrock]"` |
 | `azure` | Azure OpenAI Service (`--backend azure`, uses `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT`) | `uv tool install "graphifyy[openai]"` |
 | `sql` | SQL schema extraction | `uv tool install "graphifyy[sql]"` |
-| `godot` | GDScript `.gd` classes, methods, properties, literal `preload`/`load` and unique global-class links; `.tres` resources and `.tscn` scenes; recognized test-inventory CSVs linked to smoke scripts; PowerShell `Import-Csv` links | `uv tool install "graphifyy[godot]"` |
+| `godot` | GDScript declarations and supported static calls; `.tres` resources, `.tscn` scenes, `project.godot` settings, scene-attached NodePaths, and recognized test-inventory CSVs | `uv tool install "graphifyy[godot]"` |
+
+Godot support is actively developed by the community fork. See
+[`docs/godot-support.md`](docs/godot-support.md) for the tested support matrix
+and static-analysis limits; this is not complete Godot language or runtime
+coverage.
 | `postgres` | Live PostgreSQL introspection (`--postgres DSN`) | `uv tool install "graphifyy[postgres]"` |
 | `dm` | BYOND DreamMaker `.dm`/`.dme` AST extraction (may need a C compiler + `python3-dev` if no wheel matches your platform) | `uv tool install "graphifyy[dm]"` |
 | `terraform` | Terraform / HCL `.tf`/`.tfvars`/`.hcl` AST extraction | `uv tool install "graphifyy[terraform]"` |

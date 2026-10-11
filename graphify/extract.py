@@ -52,7 +52,7 @@ from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.erlang import extract_erlang, resolve_erlang_remote_calls  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.gdscript import extract_gdscript  # noqa: F401
-from graphify.extractors.godot_text import extract_godot_text  # noqa: F401
+from graphify.extractors.godot_text import extract_godot_project, extract_godot_text  # noqa: F401
 from graphify.godot_resolution import resolve_godot_resources
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
@@ -196,7 +196,7 @@ def _safe_extract(
     extractor: Callable, path: Path, *, scan_root: Path | None = None
 ) -> dict:
     try:
-        if extractor in (extract_python, extract_gdscript, extract_godot_text):
+        if extractor in (extract_python, extract_gdscript, extract_godot_text, extract_godot_project):
             return extractor(path, root=scan_root)
         return extractor(path)
     except RecursionError:
@@ -3424,6 +3424,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".gd": "gdscript",
     ".tres": "gdscript",
     ".tscn": "gdscript",
+    ".godot": "gdscript",
     ".rs": "rust",
     ".cbl": "cobol", ".cob": "cobol", ".cobol": "cobol", ".cpy": "cobol",
     ".r": "r",
@@ -6175,7 +6176,7 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver(
         "godot_resource_links",
-        frozenset({".gd", ".tres", ".tscn"}),
+        frozenset({".gd", ".tres", ".tscn", ".godot"}),
         resolve_godot_resources,
     )
 )
@@ -7332,6 +7333,7 @@ _DISPATCH: dict[str, Any] = {
     ".gd": extract_gdscript,
     ".tres": extract_godot_text,
     ".tscn": extract_godot_text,
+    ".godot": extract_godot_project,
     ".csv": extract_verification_manifest,
     ".py": extract_python,
     ".js": extract_js,

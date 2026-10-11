@@ -38,7 +38,7 @@ except Exception:
 
 # Bump when AST cache-key semantics change independently of the package version.
 # Schema 12 adds static GDScript references and portable test-inventory facts.
-_AST_CACHE_SCHEMA = 12
+_AST_CACHE_SCHEMA = 13
 
 
 # Per-process memo: distributions() scans site-packages metadata, which is

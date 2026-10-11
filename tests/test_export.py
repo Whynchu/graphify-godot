@@ -451,6 +451,148 @@ def _vis_edges_from_html(content: str) -> list:
     return json.loads(m.group(1).replace("<\\/", "</"))
 
 
+def test_html_source_groups_classify_paths_and_explicit_overrides(tmp_path, monkeypatch):
+    import networkx as nx
+    from graphify.exporters.html import _source_group_for_node, to_html
+
+    assert _source_group_for_node({"source_file": "docs/README.md"}) == "docs"
+    assert _source_group_for_node({"source_file": r"tests\combat_smoke.gd"}) == "tests"
+    assert _source_group_for_node({"source_file": "tests/addons/plugin/test_tool.py"}) == "addons"
+    assert _source_group_for_node({"source_file": "tools/tests/reindex.py"}) == "tools"
+    assert _source_group_for_node({"source_file": "scenes/room.tscn"}) == "scenes"
+    assert _source_group_for_node({"source_file": "resources/enemy.tres"}) == "resources"
+    assert _source_group_for_node({"source_file": "project.godot"}) == "config"
+    assert _source_group_for_node({"source_file": "odd.data", "source_group": "scripts"}) == "scripts"
+    assert _source_group_for_node({"label": "aggregated community"}) == "other"
+    monkeypatch.setenv("GRAPHIFY_SOURCE_GROUP_OVERRIDES", '{"vendor/**":"other", "tests/keep/**":"scripts"}')
+    assert _source_group_for_node({"source_file": r"C:\repo\vendor\lib\module.py"}) == "other"
+    assert _source_group_for_node({"source_file": "tests/keep/helper.gd"}) == "scripts"
+    assert _source_group_for_node({"source_file": "vendor/lib/main.py", "source_group": "docs"}) == "docs"
+
+    graph = nx.Graph()
+    graph.add_node("script", label="Script", file_type="code", source_file="scripts/main.gd")
+    graph.add_node("guide", label="Guide", file_type="document", source_file="docs/guide.md")
+    graph.add_node("test", label="Test", file_type="code", source_file="tests/main_smoke.gd")
+    graph.add_edge("script", "guide", relation="references", confidence="EXTRACTED")
+    graph.add_edge("script", "test", relation="tests", confidence="EXTRACTED")
+    out = tmp_path / "graph.html"
+    to_html(graph, {0: ["script", "guide", "test"]}, str(out), community_labels={0: "Core"})
+    html = out.read_text(encoding="utf-8")
+
+    nodes = {node["id"]: node for node in _vis_nodes_from_html(html)}
+    assert {node_id: node["source_group"] for node_id, node in nodes.items()} == {
+        "script": "scripts", "guide": "docs", "test": "tests"
+    }
+    for group in ("docs", "tests", "scripts", "scenes", "resources", "tools", "addons", "config", "other"):
+        assert f'"id": "{group}"' in html or f'"id":"{group}"' in html
+    assert "isNodeVisible" in html
+    assert "hidden: !visibleIds.has(e.from) || !visibleIds.has(e.to)" in html
+    assert "#filters=" in html
+    assert 'id="source-game-preset"' in html
+    assert 'id="source-verification-preset"' in html
+    assert 'id="source-reset-filters"' in html
+    assert "GRAPHIFY_SOURCE_GROUP_OVERRIDES" not in html
+    assert "keyboard: { enabled: true, bindToWindow: false }" in html
+    assert "aria-label" in html
+
+
+def test_html_source_and_community_filters_intersect_at_runtime(tmp_path):
+    import shutil
+    import subprocess
+    import networkx as nx
+    import pytest
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+
+    graph = nx.Graph()
+    graph.add_node("script", label="GameScript", file_type="code", source_file="scripts/main.gd")
+    graph.add_node("test", label="CombatTest", file_type="code", source_file="tests/combat_test.gd")
+    graph.add_node("docs", label="Guide", file_type="document", source_file="docs/guide.md")
+    graph.add_edge("script", "test", relation="tests", confidence="EXTRACTED")
+    graph.add_edge("script", "docs", relation="references", confidence="EXTRACTED")
+    out = tmp_path / "graph.html"
+    from graphify.exporters.html import to_html
+    to_html(graph, {0: ["script", "test"], 1: ["docs"]}, str(out), community_labels={0: "Game", 1: "Docs"})
+    content = out.read_text(encoding="utf-8")
+    match = re.search(r"<script>(.*?)</script>\s*<script>", content, re.DOTALL)
+    assert match
+    script = match.group(1)
+
+    harness = f"""
+const registry = new Map(), allElements = [];
+function makeElement(tag='div') {{
+  const listeners = {{}}, classes = new Set(), children = [];
+  const el = {{tag, listeners, children, style: {{}}, checked: true, indeterminate: false,
+    value: '', innerHTML: '', textContent: '', className: '',
+    addEventListener(name, fn) {{ (listeners[name] ||= []).push(fn); }},
+    dispatchEvent(event) {{ (listeners[event.type] || []).forEach(fn => fn(event)); }},
+    appendChild(child) {{ children.push(child); return child; }}, prepend(child) {{ children.unshift(child); }},
+    classList: {{ add(name) {{ classes.add(name); }}, remove(name) {{ classes.delete(name); }} }},
+    setAttribute() {{}}
+  }};
+  Object.defineProperty(el, 'id', {{ set(v) {{ this._id = v; registry.set(v, this); }}, get() {{ return this._id || ''; }} }});
+  allElements.push(el); return el;
+}}
+const document = {{
+  getElementById(id) {{ return registry.get(id) || (Object.assign(makeElement(), {{id}})); }},
+  createElement(tag) {{ return makeElement(tag); }}, createTextNode(text) {{ return {{textContent: text}}; }},
+  addEventListener() {{}},
+  querySelectorAll(sel) {{ const cls = sel.startsWith('.') ? sel.slice(1) : ''; return allElements.filter(e => e.className === cls); }}
+}};
+const window = {{location: {{hash: ''}}, history: {{replaceState(_a,_b,url) {{ window.location.hash = url.slice(url.indexOf('#')); }}}}}};
+const empty = ['graph','info-content','search','search-results','source-groups','source-select-all-cb','source-clear-cb',
+ 'source-game-preset','source-verification-preset','source-everything-preset','source-reset-filters','select-all-cb','legend'];
+empty.forEach(id => {{ const e=makeElement(); e.id=id; }});
+class DataSet {{ constructor(items) {{ this.items=new Map(items.map(x=>[x.id,{{...x}}])); }} get(id) {{ return this.items.get(id); }} update(items) {{ items.forEach(x=>Object.assign(this.items.get(x.id),x)); }} }}
+let selected=[];
+const vis={{DataSet,Network:class {{ constructor(){{}} once(){{}} on(){{}} focus(){{}} selectNodes(ids){{selected=ids;}} getSelectedNodes(){{return selected;}} unselectAll(){{selected=[];}} }}}};
+{script}
+network.selectNodes(['test']);
+const testGroup=allElements.find(e=>e.className==='source-group-cb' && e.value==='tests');
+testGroup.checked=false; testGroup.listeners.change[0]();
+const hiddenAfterGroup=nodesDS.get('test').hidden, selectionCleared=selected.length===0;
+const gameCommunity=allElements.find(e=>e.className==='legend-cb' && e.checked);
+gameCommunity.checked=false; gameCommunity.listeners.change[0]({{stopPropagation(){{}}}});
+gameCommunity.checked=true; gameCommunity.listeners.change[0]({{stopPropagation(){{}}}});
+const hiddenAfterCommunityRestore=nodesDS.get('test').hidden;
+const testEdge=Array.from(edgesDS.items.values()).find(e=>e.from==='script'&&e.to==='test');
+const search=document.getElementById('search'); search.value='CombatTest'; search.dispatchEvent(new Event('input'));
+console.log(JSON.stringify({{hiddenAfterGroup,selectionCleared,hiddenAfterCommunityRestore,edgeHidden:testEdge.hidden,searchResults:document.getElementById('search-results').children.length,hash:window.location.hash}}));
+"""
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    state = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert state["hiddenAfterGroup"] is True
+    assert state["selectionCleared"] is True
+    assert state["hiddenAfterCommunityRestore"] is True
+    assert state["edgeHidden"] is True
+    assert state["searchResults"] == 0
+    assert "#filters=" in state["hash"]
+
+
+def test_html_aggregated_communities_retain_source_group_membership(tmp_path):
+    import networkx as nx
+    from graphify.exporters.html import to_html
+
+    graph = nx.Graph()
+    graph.add_node("script", label="GameScript", file_type="code", source_file="scripts/main.gd")
+    graph.add_node("test", label="CombatTest", file_type="code", source_file="tests/combat_test.gd")
+    graph.add_node("docs", label="Guide", file_type="document", source_file="docs/guide.md")
+    graph.add_edge("script", "docs", relation="references", confidence="EXTRACTED")
+    communities = {0: ["script", "test"], 1: ["docs"]}
+    out = tmp_path / "graph.html"
+    to_html(graph, communities, str(out), community_labels={0: "Gameplay", 1: "Docs"}, node_limit=2)
+    html = out.read_text(encoding="utf-8")
+    nodes = _vis_nodes_from_html(html)
+    gameplay = next(node for node in nodes if node["label"] == "Gameplay")
+    assert set(gameplay["source_groups"]) == {"scripts", "tests"}
+    assert gameplay["source_group_counts"] == {"scripts": 1, "tests": 1}
+    assert "Mixed communities stay visible" in html
+    assert "cannot separate members inside one community" in html
+    assert "2 community nodes representing 3 source nodes" in html
+
+
 def test_to_html_annotated_node_gets_learning_status_and_ring():
     """A node with an overlay entry gets learning_status + learning_stale fields,
     a status-colored ring (border), and a Lesson line in its hover title."""
@@ -1273,6 +1415,7 @@ const mockElem = () => ({{
   style: {{}},
   appendChild: () => {{}},
   addEventListener: () => {{}},
+  setAttribute: () => {{}},
   classList: {{ add: () => {{}}, remove: () => {{}} }},
   prepend: () => {{}},
 }});

@@ -4,6 +4,8 @@ from __future__ import annotations
 from graphify.exporters.base import COMMUNITY_COLORS  # noqa: E402,F401
 from pathlib import Path
 import html as _html
+import fnmatch
+import os
 from graphify.analyze import _node_community_map
 from graphify.paths import write_text_atomic
 import json
@@ -13,6 +15,81 @@ from graphify.security import sanitize_label
 
 MAX_NODES_FOR_VIZ = 5_000
 _HTML_STALE_MARKER = ".graph.html.stale"
+SOURCE_GROUPS = (
+    ("docs", "Docs"),
+    ("tests", "Tests"),
+    ("scripts", "Scripts"),
+    ("scenes", "Scenes"),
+    ("resources", "Resources"),
+    ("tools", "Tools"),
+    ("addons", "Addons"),
+    ("config", "Config"),
+    ("other", "Other"),
+)
+_SOURCE_GROUP_IDS = {group_id for group_id, _label in SOURCE_GROUPS}
+
+
+def _source_group_for_node(data: dict) -> str:
+    """Classify a graph node by explicit override, source ownership, then suffix."""
+    explicit = str(data.get("source_group") or "").strip().lower()
+    if explicit in _SOURCE_GROUP_IDS:
+        return explicit
+
+    source = str(data.get("source_file") or data.get("path") or "")
+    normalized = source.replace("\\", "/").casefold()
+    parts = [part for part in normalized.split("/") if part]
+    suffix = Path(source).suffix.casefold()
+
+    # Project-specific rules are JSON so shell wrappers and CI can share the
+    # same portable configuration. Patterns match the complete normalized
+    # path or any suffix, allowing `vendor/**` to work on absolute paths too.
+    try:
+        overrides = json.loads(os.environ.get("GRAPHIFY_SOURCE_GROUP_OVERRIDES", "{}"))
+    except (TypeError, ValueError):
+        overrides = {}
+    if isinstance(overrides, dict):
+        candidates = [normalized]
+        candidates.extend("/".join(parts[index:]) for index in range(len(parts)))
+        for pattern, group in overrides.items():
+            group_id = str(group).strip().lower()
+            if group_id not in _SOURCE_GROUP_IDS:
+                continue
+            normalized_pattern = str(pattern).replace("\\", "/").casefold().lstrip("/")
+            if normalized_pattern and any(fnmatch.fnmatchcase(candidate, normalized_pattern) for candidate in candidates):
+                return group_id
+
+    # Ownership wins over fixture type: addon/tool tests stay with their owner.
+    if any(part in {"addons", "addon", "plugins", "plugin"} for part in parts):
+        return "addons"
+    if any(part in {"tools", "tooling", "scripts_tools"} for part in parts):
+        return "tools"
+    if any(part in {"tests", "test", "spec", "specs", "verification"} for part in parts):
+        return "tests"
+    if suffix in {".md", ".rst", ".adoc", ".txt"}:
+        return "docs"
+    if suffix == ".tscn":
+        return "scenes"
+    if suffix in {".tres", ".res", ".scn"}:
+        return "resources"
+    if suffix in {".godot", ".toml", ".ini", ".cfg", ".yaml", ".yml", ".json", ".csv", ".xml"}:
+        return "config"
+    if suffix in {
+        ".gd", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+        ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".java", ".kt", ".kts",
+        ".rs", ".go", ".rb", ".php", ".swift", ".lua", ".sh", ".ps1", ".sql",
+    }:
+        return "scripts"
+    return "other"
+
+
+def _source_groups_for_node(data: dict) -> list[str]:
+    """Return source groups represented by a node, including aggregate nodes."""
+    raw = data.get("source_groups")
+    if isinstance(raw, (list, tuple, set)):
+        groups = sorted({str(value).strip().lower() for value in raw} & _SOURCE_GROUP_IDS)
+        if groups:
+            return groups
+    return [_source_group_for_node(data)]
 
 def _viz_node_limit() -> int:
     """Return the effective viz node limit, honoring GRAPHIFY_VIZ_NODE_LIMIT env var.
@@ -67,6 +144,15 @@ def _html_styles() -> str:
   .legend-cb:checked::after, #select-all-cb:checked::after { content: ''; position: absolute; left: 3.5px; top: 1px; width: 4px; height: 7px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
   #select-all-cb:indeterminate { background: #4E79A7; border-color: #4E79A7; }
   #select-all-cb:indeterminate::after { content: ''; position: absolute; left: 2px; top: 5px; width: 8px; height: 2px; background: #fff; border: none; transform: none; }
+  #source-filter-wrap { padding: 10px 12px; border-bottom: 1px solid #2a2a4e; }
+  #source-filter-wrap h3 { font-size: 13px; color: #aaa; margin-bottom: 7px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .source-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 7px; }
+  .source-actions button { background: #24243b; color: #bbb; border: 1px solid #3a3a5e; border-radius: 4px; padding: 3px 5px; font-size: 10px; cursor: pointer; }
+  #source-groups { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 7px; max-height: 118px; overflow-y: auto; }
+  #source-group-note { color: #777; font-size: 10px; line-height: 1.4; margin-top: 6px; }
+  .source-group-item, #source-select-all { display: flex; align-items: center; gap: 5px; cursor: pointer; font-size: 11px; color: #bbb; }
+  .source-group-item input, #source-select-all input { accent-color: #4E79A7; }
+  button:focus-visible, input:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
 </style>"""
 
 def _hyperedge_script(hyperedges_json: str) -> str:
@@ -136,11 +222,12 @@ network.on('afterDrawing', function(ctx) {{
 }});
 </script>"""
 
-def _html_script(nodes_json: str, edges_json: str, legend_json: str) -> str:
+def _html_script(nodes_json: str, edges_json: str, legend_json: str, source_groups_json: str) -> str:
     return f"""<script>
 const RAW_NODES = {nodes_json};
 const RAW_EDGES = {edges_json};
 const LEGEND = {legend_json};
+const SOURCE_GROUPS = {source_groups_json};
 
 // HTML-escape helper — prevents XSS when injecting graph data into innerHTML
 function esc(s) {{
@@ -159,6 +246,9 @@ const nodesDS = new vis.DataSet(RAW_NODES.map((n, i) => ({{
   y: 30 * Math.sqrt(i) * Math.sin(i * 2.4),
   community: n.community, community_name: n.community_name,
   source_file: n.source_file, file_type: n.file_type, degree: n.degree,
+  source_group: n.source_group,
+  source_groups: n.source_groups,
+  source_group_counts: n.source_group_counts,
   member_count: n.member_count,
 }})));
 
@@ -192,7 +282,7 @@ const network = new vis.Network(container, {{ nodes: nodesDS, edges: edgesDS }},
     tooltipDelay: 100,
     hideEdgesOnDrag: true,
     navigationButtons: false,
-    keyboard: false,
+    keyboard: {{ enabled: true, bindToWindow: false }},
   }},
   nodes: {{ shape: 'dot', borderWidth: 1.5 }},
   edges: {{ smooth: {{ type: 'continuous', roundness: 0.2 }}, selectionWidth: 3 }},
@@ -205,7 +295,10 @@ network.once('stabilizationIterationsDone', () => {{
 function showInfo(nodeId) {{
   const n = nodesDS.get(nodeId);
   if (!n) return;
-  const neighborIds = network.getConnectedNodes(nodeId);
+  const allNeighborIds = [...new Set(RAW_EDGES
+    .filter(e => e.from === nodeId || e.to === nodeId)
+    .map(e => e.from === nodeId ? e.to : e.from))];
+  const neighborIds = allNeighborIds.filter(id => isNodeVisible(RAW_NODES.find(n => n.id === id)));
   const neighborItems = neighborIds.map(nid => {{
     const nb = nodesDS.get(nid);
     const color = nb ? nb.color.background : '#555';
@@ -217,14 +310,24 @@ function showInfo(nodeId) {{
     html += `<div class="field">Type: ${{esc(n.file_type || 'unknown')}}</div>`;
   }}
   html += `<div class="field">Community: ${{esc(n.community_name || '')}}</div>`;
+  if (n.source_groups && n.source_groups.length) {{
+    const groupNames = n.source_groups.map(id => {{
+      const label = SOURCE_GROUPS.find(g => g.id === id)?.label || id;
+      const count = n.source_group_counts && n.source_group_counts[id];
+      return count ? `${{label}} (${{count}})` : label;
+    }}).join(', ');
+    html += `<div class="field">Source groups: ${{esc(groupNames)}}</div>`;
+  }}
   if (!isMetaNode) {{
     html += `<div class="field">Source: ${{esc(n.source_file || '-')}}</div>`;
   }} else if (n.member_count !== undefined && n.member_count !== null) {{
     html += `<div class="field">Members: ${{esc(n.member_count)}}</div>`;
   }}
   html += `<div class="field">Degree: ${{n.degree}}</div>`;
-  if (neighborIds.length) {{
-    html += `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>`;
+  if (neighborIds.length || allNeighborIds.length) {{
+    const hiddenNeighborCount = allNeighborIds.length - neighborIds.length;
+    const hiddenLabel = hiddenNeighborCount ? `, ${{hiddenNeighborCount}} hidden by filters` : '';
+    html += `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}} visible${{hiddenLabel}})</div><div id="neighbors-list">${{neighborItems}}</div>`;
   }}
   document.getElementById('info-content').innerHTML = html;
 }}
@@ -273,12 +376,13 @@ network.on('click', params => {{
 }});
 
 const searchInput = document.getElementById('search');
+searchInput.setAttribute('aria-label', 'Search visible graph nodes');
 const searchResults = document.getElementById('search-results');
 searchInput.addEventListener('input', () => {{
   const q = searchInput.value.toLowerCase().trim();
   searchResults.innerHTML = '';
   if (!q) {{ searchResults.style.display = 'none'; return; }}
-  const matches = RAW_NODES.filter(n => n.label.toLowerCase().includes(q)).slice(0, 20);
+  const matches = RAW_NODES.filter(n => isNodeVisible(n) && n.label.toLowerCase().includes(q)).slice(0, 20);
   if (!matches.length) {{ searchResults.style.display = 'none'; return; }}
   searchResults.style.display = 'block';
   matches.forEach(n => {{
@@ -303,6 +407,97 @@ document.addEventListener('click', e => {{
 }});
 
 const hiddenCommunities = new Set();
+const hiddenSourceGroups = new Set();
+
+function isNodeVisible(node) {{
+  const groups = node && Array.isArray(node.source_groups) && node.source_groups.length
+    ? node.source_groups : (node ? [node.source_group] : []);
+  return Boolean(node) && !hiddenCommunities.has(node.community) && groups.some(group => !hiddenSourceGroups.has(group));
+}}
+
+function updateVisibility() {{
+  const visibleIds = new Set(RAW_NODES.filter(isNodeVisible).map(n => n.id));
+  nodesDS.update(RAW_NODES.map(n => ({{ id: n.id, hidden: !visibleIds.has(n.id) }})));
+  edgesDS.update(RAW_EDGES.map((e, i) => ({{
+    id: i, hidden: !visibleIds.has(e.from) || !visibleIds.has(e.to)
+  }})));
+  LEGEND.forEach(c => {{
+    const visible = RAW_NODES.filter(n => n.community === c.cid && visibleIds.has(n.id)).length;
+    const countEl = document.getElementById(`community-count-${{c.cid}}`);
+    if (countEl) countEl.textContent = visible === c.count ? String(c.count) : `${{visible}} / ${{c.count}}`;
+  }});
+  SOURCE_GROUPS.forEach(g => {{
+    const total = RAW_NODES.filter(n => Array.isArray(n.source_groups) ? n.source_groups.includes(g.id) : n.source_group === g.id).length;
+    const visible = RAW_NODES.filter(n => (Array.isArray(n.source_groups) ? n.source_groups.includes(g.id) : n.source_group === g.id) && visibleIds.has(n.id)).length;
+    const countEl = document.getElementById(`source-group-count-${{g.id}}`);
+    if (countEl) countEl.textContent = visible === total ? String(total) : `${{visible}} / ${{total}}`;
+  }});
+  const selected = network.getSelectedNodes ? network.getSelectedNodes() : [];
+  if (selected.length && !visibleIds.has(selected[0])) {{
+    network.unselectAll();
+    document.getElementById('info-content').innerHTML = '<span class="empty">Click a node to inspect it</span>';
+  }}
+  if (searchInput.dispatchEvent) searchInput.dispatchEvent(new Event('input'));
+}}
+
+function persistFilters() {{
+  if (!window.history || !window.location) return;
+  const state = {{
+    groups: SOURCE_GROUPS.filter(g => !hiddenSourceGroups.has(g.id)).map(g => g.id),
+    communities: LEGEND.filter(c => !hiddenCommunities.has(c.cid)).map(c => c.cid),
+  }};
+  window.history.replaceState(null, '', '#filters=' + encodeURIComponent(JSON.stringify(state)));
+}}
+
+function restoreFilters() {{
+  if (!window.location || !window.location.hash.startsWith('#filters=')) return;
+  try {{
+    const state = JSON.parse(decodeURIComponent(window.location.hash.slice(9)));
+    if (Array.isArray(state.groups)) SOURCE_GROUPS.forEach(g => {{ if (!state.groups.includes(g.id)) hiddenSourceGroups.add(g.id); }});
+    if (Array.isArray(state.communities)) LEGEND.forEach(c => {{ if (!state.communities.includes(c.cid)) hiddenCommunities.add(c.cid); }});
+  }} catch (_error) {{ /* Invalid shared state leaves the default view active. */ }}
+}}
+
+function setSourceGroups(groups) {{
+  const selected = new Set(groups);
+  SOURCE_GROUPS.forEach(g => {{
+    if (selected.has(g.id)) hiddenSourceGroups.delete(g.id); else hiddenSourceGroups.add(g.id);
+  }});
+  document.querySelectorAll('.source-group-cb').forEach(cb => {{ cb.checked = selected.has(cb.value); }});
+  updateVisibility();
+  persistFilters();
+}}
+
+const groupCheckboxes = document.getElementById('source-groups');
+SOURCE_GROUPS.forEach(g => {{
+  const label = document.createElement('label');
+  label.className = 'source-group-item';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'source-group-cb';
+  cb.value = g.id;
+  cb.setAttribute('aria-label', `${{g.label}} source group`);
+  cb.checked = true;
+  cb.addEventListener('change', () => {{
+    if (cb.checked) hiddenSourceGroups.delete(g.id); else hiddenSourceGroups.add(g.id);
+    updateVisibility();
+    persistFilters();
+    updateSelectAllState();
+  }});
+  label.appendChild(cb);
+  const text = document.createElement('span');
+  text.textContent = `${{g.label}} (`;
+  const count = document.createElement('span');
+  count.className = 'source-group-count';
+  count.id = `source-group-count-${{g.id}}`;
+  count.textContent = String(RAW_NODES.filter(n => Array.isArray(n.source_groups) ? n.source_groups.includes(g.id) : n.source_group === g.id).length);
+  text.appendChild(count);
+  text.appendChild(document.createTextNode ? document.createTextNode(')') : Object.assign(document.createElement('span'), {{ textContent: ')' }}));
+  label.appendChild(text);
+  groupCheckboxes.appendChild(label);
+}});
+restoreFilters();
+document.querySelectorAll('.source-group-cb').forEach(cb => {{ cb.checked = !hiddenSourceGroups.has(cb.value); }});
 
 const selectAllCb = document.getElementById('select-all-cb');
 
@@ -311,6 +506,10 @@ function updateSelectAllState() {{
   const hidden = hiddenCommunities.size;
   selectAllCb.checked = hidden === 0;
   selectAllCb.indeterminate = hidden > 0 && hidden < total;
+  const sourceSelectAll = document.getElementById('source-select-all-cb');
+  const hiddenGroupCount = hiddenSourceGroups.size;
+  sourceSelectAll.checked = hiddenGroupCount === 0;
+  sourceSelectAll.indeterminate = hiddenGroupCount > 0 && hiddenGroupCount < SOURCE_GROUPS.length;
 }}
 
 function toggleAllCommunities(hide) {{
@@ -323,9 +522,9 @@ function toggleAllCommunities(hide) {{
   LEGEND.forEach(c => {{
     if (hide) hiddenCommunities.add(c.cid); else hiddenCommunities.delete(c.cid);
   }});
-  const updates = RAW_NODES.map(n => ({{ id: n.id, hidden: hide }}));
-  nodesDS.update(updates);
+  updateVisibility();
   updateSelectAllState();
+  persistFilters();
 }}
 
 const legendEl = document.getElementById('legend');
@@ -335,7 +534,9 @@ LEGEND.forEach(c => {{
   const cb = document.createElement('input');
   cb.type = 'checkbox';
   cb.className = 'legend-cb';
-  cb.checked = true;
+  cb.setAttribute('aria-label', `Show community ${{c.label}}`);
+  cb.checked = !hiddenCommunities.has(c.cid);
+  if (!cb.checked) item.classList.add('dimmed');
   cb.addEventListener('change', (e) => {{
     e.stopPropagation();
     if (cb.checked) {{
@@ -345,15 +546,13 @@ LEGEND.forEach(c => {{
       hiddenCommunities.add(c.cid);
       item.classList.add('dimmed');
     }}
-    const updates = RAW_NODES
-      .filter(n => n.community === c.cid)
-      .map(n => ({{ id: n.id, hidden: !cb.checked }}));
-    nodesDS.update(updates);
+    updateVisibility();
     updateSelectAllState();
+    persistFilters();
   }});
   item.innerHTML = `<div class="legend-dot" style="background:${{c.color}}"></div>
     <span class="legend-label">${{c.label}}</span>
-    <span class="legend-count">${{c.count}}</span>`;
+    <span class="legend-count" id="community-count-${{c.cid}}">${{c.count}}</span>`;
   item.prepend(cb);
   item.onclick = (e) => {{
     if (e.target === cb) return;
@@ -362,6 +561,34 @@ LEGEND.forEach(c => {{
   }};
   legendEl.appendChild(item);
 }});
+
+document.getElementById('source-select-all-cb').addEventListener('change', e => {{
+  setSourceGroups(e.target.checked ? SOURCE_GROUPS.map(g => g.id) : []);
+  updateSelectAllState();
+}});
+document.getElementById('source-clear-cb').addEventListener('click', () => {{
+  setSourceGroups([]);
+  updateSelectAllState();
+}});
+document.getElementById('source-game-preset').addEventListener('click', () => {{
+  setSourceGroups(['scripts', 'scenes', 'resources']);
+  updateSelectAllState();
+}});
+document.getElementById('source-verification-preset').addEventListener('click', () => {{
+  setSourceGroups(['tests', 'scripts', 'scenes', 'resources']);
+  updateSelectAllState();
+}});
+document.getElementById('source-everything-preset').addEventListener('click', () => {{
+  setSourceGroups(SOURCE_GROUPS.map(g => g.id));
+  updateSelectAllState();
+}});
+document.getElementById('source-reset-filters').addEventListener('click', () => {{
+  setSourceGroups(SOURCE_GROUPS.map(g => g.id));
+  toggleAllCommunities(false);
+  updateSelectAllState();
+}});
+updateVisibility();
+updateSelectAllState();
 </script>"""
 
 
@@ -442,7 +669,17 @@ def to_html(
             node_to_community = {nid: cid for cid, members in communities.items() for nid in members}
             meta = _nx.Graph()
             for cid, members in communities.items():
-                meta.add_node(str(cid), label=(community_labels or {}).get(cid, f"Community {cid}"))
+                group_counts: dict[str, int] = {}
+                for group_id, _label in SOURCE_GROUPS:
+                    count = sum(group_id in _source_groups_for_node(G.nodes[nid]) for nid in members if nid in G)
+                    if count:
+                        group_counts[group_id] = count
+                meta.add_node(
+                    str(cid),
+                    label=(community_labels or {}).get(cid, f"Community {cid}"),
+                    source_groups=sorted(group_counts),
+                    source_group_counts=group_counts,
+                )
             edge_counts = _Counter()
             for u, v in G.edges():
                 cu, cv = node_to_community.get(u), node_to_community.get(v)
@@ -480,6 +717,8 @@ def to_html(
                         "nodes": comm_ids,
                     })
                 meta.graph["hyperedges"] = remapped
+            meta.graph["source_node_count"] = G.number_of_nodes()
+            meta.graph["source_edge_count"] = G.number_of_edges()
             written = to_html(meta, meta_communities, output_path,
                               community_labels=community_labels, member_counts=mc)
             if not written:
@@ -548,6 +787,9 @@ def to_html(
             "community_name": sanitize_label((community_labels or {}).get(cid, f"Community {cid}")),
             "source_file": sanitize_label(str(data.get("source_file") or "")),
             "file_type": data.get("file_type", ""),
+            "source_group": _source_group_for_node(data),
+            "source_groups": _source_groups_for_node(data),
+            "source_group_counts": data.get("source_group_counts", {}),
             "degree": deg,
         }
         if member_counts:
@@ -624,9 +866,31 @@ def to_html(
     nodes_json = _js_safe(vis_nodes)
     edges_json = _js_safe(vis_edges)
     legend_json = _js_safe(legend_data)
+    source_groups_json = _js_safe([
+        {"id": group_id, "label": label}
+        for group_id, label in SOURCE_GROUPS
+    ])
     hyperedges_json = _js_safe(getattr(G, "graph", {}).get("hyperedges", []))
     title = _html.escape(sanitize_label(_html_document_title(output_path)))
-    stats = f"{G.number_of_nodes()} nodes &middot; {G.number_of_edges()} edges &middot; {len(communities)} communities"
+    source_node_count = G.graph.get("source_node_count")
+    if source_node_count is not None:
+        stats = (
+            f"{G.number_of_nodes()} community nodes representing {source_node_count} source nodes"
+            f" &middot; {G.number_of_edges()} cross-community edges"
+        )
+    else:
+        stats = (
+            f"{G.number_of_nodes()} nodes included of {G.number_of_nodes()} source nodes"
+            f" &middot; {G.number_of_edges()} edges &middot; {len(communities)} communities"
+        )
+    has_aggregated_source_groups = any(
+        isinstance(data.get("source_group_counts"), dict) and data.get("source_group_counts")
+        for _node_id, data in G.nodes(data=True)
+    )
+    source_group_note = (
+        '<div id="source-group-note">This is a community summary. Mixed communities stay visible while any represented group is enabled; group filters cannot separate members inside one community. Node Info shows represented group counts.</div>'
+        if has_aggregated_source_groups else ""
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -649,6 +913,21 @@ def to_html(
     <h3>Node Info</h3>
     <div id="info-content"><span class="empty">Click a node to inspect it</span></div>
   </div>
+  <div id="source-filter-wrap">
+    <h3>Source Groups</h3>
+  <div class="source-actions">
+      <button type="button" id="source-game-preset">Game</button>
+      <button type="button" id="source-verification-preset">Verification</button>
+      <button type="button" id="source-everything-preset">Everything</button>
+      <button type="button" id="source-reset-filters">Reset filters</button>
+    </div>
+    <div class="source-actions">
+      <label id="source-select-all"><input type="checkbox" id="source-select-all-cb" checked>Select all</label>
+      <button type="button" id="source-clear-cb">Clear all</button>
+    </div>
+    <div id="source-groups"></div>
+    {source_group_note}
+  </div>
   <div id="legend-wrap">
     <h3>Communities</h3>
     <div id="legend-controls">
@@ -658,7 +937,7 @@ def to_html(
   </div>
   <div id="stats">{stats}</div>
 </div>
-{_html_script(nodes_json, edges_json, legend_json)}
+{_html_script(nodes_json, edges_json, legend_json, source_groups_json)}
 {_hyperedge_script(hyperedges_json)}
 </body>
 </html>"""

@@ -11,7 +11,7 @@ from graphify.build import build_from_json
 from graphify.detect import CODE_EXTENSIONS
 from graphify.extract import _DISPATCH, collect_files, extract
 from graphify.extractors import LANGUAGE_EXTRACTORS
-from graphify.extractors.godot_text import extract_godot_text
+from graphify.extractors.godot_text import extract_godot_project, extract_godot_text
 
 
 _needs_gdscript = pytest.mark.skipif(
@@ -35,12 +35,149 @@ def test_godot_text_files_are_discovered_as_code(tmp_path: Path):
     scene.write_text("[gd_scene format=3]\n", encoding="utf-8")
 
     assert {".tres", ".tscn"} <= CODE_EXTENSIONS
+    assert ".godot" in CODE_EXTENSIONS
     assert _DISPATCH[".tres"] is extract_godot_text
     assert _DISPATCH[".tscn"] is extract_godot_text
+    assert _DISPATCH[".godot"] is extract_godot_project
     assert LANGUAGE_EXTRACTORS["godot_text"] is extract_godot_text
     assert _LANG_FAMILY[".gd"] == _LANG_FAMILY[".tres"] == _LANG_FAMILY[".tscn"] == "gdscript"
     assert resource in collect_files(tmp_path)
     assert scene in collect_files(tmp_path)
+
+
+@_needs_gdscript
+def test_project_settings_resolve_main_scene_and_autoload_calls(tmp_path: Path):
+    project = tmp_path / "project.godot"
+    project.write_text(
+        '[application]\n'
+        'config/name="Project Fixture"\n'
+        'run/main_scene="res://main.tscn"\n'
+        '[autoload]\n'
+        'GameState="*res://game_state.gd"\n',
+        encoding="utf-8",
+    )
+    scene = tmp_path / "main.tscn"
+    scene.write_text('[gd_scene format=3]\n[node name="Main" type="Node"]\n', encoding="utf-8")
+    autoload = tmp_path / "game_state.gd"
+    autoload.write_text("func reset() -> void:\n    pass\n", encoding="utf-8")
+    caller = tmp_path / "caller.gd"
+    caller.write_text("func tick() -> void:\n    GameState.reset()\n", encoding="utf-8")
+
+    project_only = extract_godot_project(project, root=tmp_path)
+    project_facts = project_only["godot_facts"]
+    assert project_facts["main_scene"] == "res://main.tscn"
+    assert project_facts["autoloads"] == [{
+        "name": "GameState", "path": "res://game_state.gd", "singleton": True,
+        "line": 5, "key": "autoload:GameState",
+    }]
+
+    result = extract([project, scene, autoload, caller], root=tmp_path, parallel=False)
+    labels = {node["id"]: node["label"].strip().lstrip(".").removesuffix("()") for node in result["nodes"]}
+    contexts = {
+        (labels[edge["source"]], labels[edge["target"]], edge.get("context"))
+        for edge in result["edges"]
+    }
+    assert ("application/run/main_scene", "Main", "godot_project_main_scene") in contexts
+    assert ("GameState", "game_state.gd", "godot_project_autoload") not in contexts
+    assert ("GameState", "game_state", "godot_project_autoload") in contexts
+    assert ("tick", "reset", "godot_gdscript_call") in contexts
+
+
+@_needs_gdscript
+def test_gdscript_node_paths_unique_names_and_attached_receiver_calls(tmp_path: Path):
+    _write_project(tmp_path)
+    enemy = tmp_path / "enemy_actor.gd"
+    enemy.write_text("class_name EnemyActor\nfunc take_damage() -> void:\n    pass\n", encoding="utf-8")
+    caller = tmp_path / "scene_caller.gd"
+    caller.write_text(
+        "class_name SceneCaller\n"
+        "func attack() -> void:\n"
+        "    $\"../Enemy\".take_damage()\n"
+        "    var enemy_ref := get_node(\"../Enemy\")\n"
+        "    enemy_ref.take_damage()\n"
+        "    var named_ref := %Target\n"
+        "    named_ref.take_damage()\n",
+        encoding="utf-8",
+    )
+    scene = tmp_path / "main.tscn"
+    scene.write_text(
+        '[gd_scene format=3]\n'
+        '[ext_resource type="Script" path="res://enemy_actor.gd" id="enemy_script"]\n'
+        '[ext_resource type="Script" path="res://scene_caller.gd" id="caller_script"]\n'
+        '[node name="Main" type="Node"]\n'
+        '[node name="Enemy" type="Node" parent="."]\n'
+        'script = ExtResource("enemy_script")\n'
+        '[node name="Target" type="Node" parent="."]\n'
+        'unique_name_in_owner = true\n'
+        'script = ExtResource("enemy_script")\n'
+        '[node name="Caller" type="Node" parent="."]\n'
+        'script = ExtResource("caller_script")\n',
+        encoding="utf-8",
+    )
+
+    result = extract([enemy, caller, scene], root=tmp_path, parallel=False)
+    labels = {node["id"]: node["label"].strip().lstrip(".").removesuffix("()") for node in result["nodes"]}
+    scene_links = [edge for edge in result["edges"] if edge.get("context") in {"godot_script_node_path", "godot_script_unique_node"}]
+    attached_calls = [
+        edge for edge in result["edges"]
+        if edge.get("relation") == "calls"
+        and edge.get("context") in {"godot_scene_attached_call", "godot_gdscript_call"}
+        and labels[edge["target"]] == "take_damage"
+    ]
+
+    assert {labels[edge["target"]] for edge in scene_links} >= {"Enemy", "Target"}
+    assert any(edge.get("context") == "godot_script_unique_node" and labels[edge["target"]] == "Target" for edge in scene_links)
+    assert len(attached_calls) == 3
+    assert all(labels[edge["source"]] == "attack" and labels[edge["target"]] == "take_damage" for edge in attached_calls)
+
+
+@_needs_gdscript
+def test_inherited_scene_nodes_and_attached_scripts_resolve_for_node_paths(tmp_path: Path):
+    _write_project(tmp_path)
+    child_script = tmp_path / "child_actor.gd"
+    child_script.write_text(
+        "class_name ChildActor\n"
+        "func ping() -> void:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    caller_script = tmp_path / "derived_actor.gd"
+    caller_script.write_text(
+        "class_name DerivedActor\n"
+        "func use_child() -> void:\n"
+        "    var child := $Child\n"
+        "    child.ping()\n",
+        encoding="utf-8",
+    )
+    base_scene = tmp_path / "base.tscn"
+    base_scene.write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://child_actor.gd" id="child_script"]\n'
+        '[node name="Base" type="Node"]\n'
+        '[node name="Child" type="Node" parent="."]\n'
+        'script = ExtResource("child_script")\n',
+        encoding="utf-8",
+    )
+    derived_scene = tmp_path / "derived.tscn"
+    derived_scene.write_text(
+        '[gd_scene load_steps=3 format=3]\n'
+        '[ext_resource type="PackedScene" path="res://base.tscn" id="base_scene"]\n'
+        '[ext_resource type="Script" path="res://derived_actor.gd" id="derived_script"]\n'
+        '[node name="Base" instance=ExtResource("base_scene")]\n'
+        'script = ExtResource("derived_script")\n',
+        encoding="utf-8",
+    )
+
+    result = extract([child_script, caller_script, base_scene, derived_scene], root=tmp_path, parallel=False)
+    labels = {node["id"]: str(node.get("label") or "").strip().lstrip(".").removesuffix("()") for node in result["nodes"]}
+    node_paths = [edge for edge in result["edges"] if edge.get("context") == "godot_script_node_path"]
+    attached_calls = [
+        edge for edge in result["edges"]
+        if edge.get("relation") == "calls" and edge.get("context") == "godot_scene_attached_call"
+    ]
+
+    assert any(labels[edge["target"]] == "Child" for edge in node_paths)
+    assert any(labels[edge["source"]] == "use_child" and labels[edge["target"]] == "ping" for edge in attached_calls)
 
 
 def test_resource_parser_keeps_nested_links_and_never_scans_strings(tmp_path: Path):
@@ -115,6 +252,62 @@ def test_resource_parser_keeps_nested_links_and_never_scans_strings(tmp_path: Pa
     assert attachment["source"] == resource_node["id"]
     assert attachment["target"] == script_class["id"]
     assert subresource_link["source"] == resource_node["id"]
+
+
+@_needs_gdscript
+def test_tres_assignments_and_property_accessors_link_to_script_definitions(tmp_path: Path):
+    _write_project(tmp_path)
+    script = tmp_path / "enemy_definition.gd"
+    script.write_text(
+        "class_name EnemyDefinition\n"
+        "extends Resource\n"
+        "@export var health: int = 0: set = set_health, get = get_health\n"
+        "@export var label: String = \"\":\n"
+        "    set(value):\n"
+        "        label = value\n"
+        "    get:\n"
+        "        return label\n"
+        "func set_health(value: int) -> void:\n"
+        "    health = value\n"
+        "func get_health() -> int:\n"
+        "    return health\n",
+        encoding="utf-8",
+    )
+    resource = tmp_path / "enemy.tres"
+    resource.write_text(
+        '[gd_resource type="Resource" script_class="EnemyDefinition" load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://enemy_definition.gd" id="script"]\n'
+        '[resource]\n'
+        'script = ExtResource("script")\n'
+        'health = 12\n'
+        'label = "Bat"\n',
+        encoding="utf-8",
+    )
+
+    result = extract([script, resource], root=tmp_path, parallel=False)
+    labels = {node["id"]: node["label"].strip().lstrip(".").removesuffix("()") for node in result["nodes"]}
+    property_nodes = {
+        node["label"]: node
+        for node in result["nodes"]
+        if (node.get("metadata") or {}).get("godot_kind") == "script_property"
+    }
+    health_metadata = property_nodes["health"]["metadata"]
+    label_metadata = property_nodes["label"]["metadata"]
+    assert (health_metadata["godot_setter"], health_metadata["godot_getter"]) == ("set_health", "get_health")
+    assert health_metadata["godot_accessor_style"] == "named"
+    assert label_metadata["godot_setter"] == "<inline>"
+    assert label_metadata["godot_getter"] == "<inline>"
+    assert label_metadata["godot_accessor_style"] == "inline"
+
+    edges = result["edges"]
+    rows = {(labels[edge["source"]], labels[edge["target"]], edge.get("context")) for edge in edges}
+    assert ("health", "set_health", "godot_script_property_setter") in rows
+    assert ("health", "get_health", "godot_script_property_getter") in rows
+    assignments = [edge for edge in edges if edge.get("context") == "godot_serialized_property_assignment"]
+    assert {(edge["source_location"], labels[edge["target"]]) for edge in assignments} == {
+        ("L5", "health"), ("L6", "label"),
+    }
+    assert any(edge.get("context") == "godot_script_property_read" and edge["target"] == property_nodes["health"]["id"] for edge in edges)
 
 
 def test_cyclic_tres_references_resolve_without_recursion(tmp_path: Path):
@@ -364,7 +557,8 @@ def test_gdscript_smoke_dependencies_resolve_to_resources_and_global_classes(tmp
         'const TEXT_ONLY = "TargetController and res://scripts/missing_controller.gd"\n'
         "func run() -> void:\n"
         "    var target: TargetController = TargetController.new()\n"
-        "    target.create()\n",
+        "    target.create()\n"
+        "    TARGET.create()\n",
         encoding="utf-8",
     )
 
@@ -395,6 +589,16 @@ def test_gdscript_smoke_dependencies_resolve_to_resources_and_global_classes(tmp
         and nodes[edge["target"]].get("label") == "Widget"
         for edge in uses
     )
+    smoke_methods = {
+        node["id"]: node for node in result["nodes"]
+        if node.get("source_file") == "tests/target_controller_smoke.gd"
+        and str(node.get("label") or "").strip().lstrip(".").removesuffix("()") == "run"
+    }
+    target_method = next(node for node in result["nodes"] if node.get("label") == "create()")
+    assert any(
+        edge.get("source") in smoke_methods and edge.get("target") == target_method["id"]
+        for edge in result["edges"]
+    )
     assert any(
         edge.get("context") == "godot_global_class_reference"
         and edge.get("target") == target_class["id"]
@@ -422,6 +626,113 @@ def test_gdscript_smoke_dependencies_resolve_to_resources_and_global_classes(tmp
         edge.get("context") == "godot_script_preload" and edge.get("target") == target_class["id"]
         for edge in incremental["edges"]
     )
+    assert any(
+        edge.get("source") in smoke_methods and edge.get("target") == target_method["id"]
+        for edge in incremental["edges"]
+    )
+
+    def source_edge_facts(graph):
+        return {
+            (
+                edge.get("relation"), edge.get("context"), edge.get("source"),
+                edge.get("target"), edge.get("source_location"), edge.get("confidence"),
+            )
+            for edge in graph["edges"]
+            if edge.get("source_file") == smoke_file["source_file"]
+        }
+
+    assert source_edge_facts(result) == source_edge_facts(incremental)
+
+
+@_needs_gdscript
+def test_renamed_gdscript_target_does_not_retain_old_preload_or_call_edges(tmp_path: Path):
+    _write_project(tmp_path)
+    original = tmp_path / "target.gd"
+    original.write_text(
+        "class_name RenameTarget\n"
+        "static func ping() -> void:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    caller = tmp_path / "caller.gd"
+    caller.write_text(
+        'const TARGET = preload("res://target.gd")\n'
+        "func run() -> void:\n"
+        "    TARGET.ping()\n",
+        encoding="utf-8",
+    )
+    cache_root = tmp_path / "graphify-cache"
+    first = extract([original, caller], root=tmp_path, cache_root=cache_root, parallel=False)
+    assert any(edge.get("context") == "godot_script_preload" for edge in first["edges"])
+    assert any(edge.get("context") == "godot_gdscript_call" for edge in first["edges"])
+
+    renamed = tmp_path / "renamed_target.gd"
+    original.rename(renamed)
+    second = extract([renamed, caller], root=tmp_path, cache_root=cache_root, parallel=False)
+    assert not any(edge.get("context") in {"godot_script_preload", "godot_gdscript_call"} for edge in second["edges"])
+    caller_file = next(node for node in second["nodes"] if node.get("label") == "caller.gd" and node.get("source_file") == "caller.gd")
+    diagnostics = caller_file["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any("target.gd" in item["message"] for item in diagnostics)
+
+
+@_needs_gdscript
+def test_dynamic_godot_boundaries_report_reasons_without_guessed_edges(tmp_path: Path):
+    _write_project(tmp_path)
+    target = tmp_path / "target.gd"
+    target.write_text(
+        "class_name BoundaryTarget\n"
+        "func remote_method() -> void:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    caller = tmp_path / "caller.gd"
+    caller.write_text(
+        "class_name BoundaryCaller\n"
+        "signal changed\n"
+        "func local_method() -> void:\n"
+        "    pass\n"
+        "func run(receiver, method_name, resource_path) -> void:\n"
+        "    self.call(\"local_method\")\n"
+        "    receiver.call(method_name)\n"
+        "    receiver.call_deferred(\"remote_method\")\n"
+        "    get_tree().call_group(\"enemies\", \"remote_method\")\n"
+        "    get_tree().get_nodes_in_group(\"enemies\")\n"
+        "    receiver.set_script(load(\"res://target.gd\"))\n"
+        "    add_child(Node.new())\n"
+        "    changed.connect(Callable(receiver, method_name))\n"
+        "    load(resource_path)\n",
+        encoding="utf-8",
+    )
+
+    result = extract([target, caller], root=tmp_path, parallel=False)
+    caller_class = next(
+        node for node in result["nodes"]
+        if node.get("label") == "BoundaryCaller"
+        and (node.get("metadata") or {}).get("godot_kind") == "script_class"
+    )
+    target_class = next(
+        node for node in result["nodes"]
+        if node.get("label") == "BoundaryTarget"
+        and (node.get("metadata") or {}).get("godot_kind") == "script_class"
+    )
+    labels = {node["id"]: str(node.get("label") or "").strip().lstrip(".").removesuffix("()") for node in result["nodes"]}
+    calls = [edge for edge in result["edges"] if edge.get("relation") == "calls"]
+    assert any(edge.get("context") == "godot_dynamic_literal_call" and labels[edge["target"]] == "local_method" for edge in calls)
+    assert not any(edge.get("source") == caller_class["id"] and edge.get("target") == target_class["id"] for edge in calls)
+
+    caller_file = next(
+        node for node in result["nodes"]
+        if node.get("label") == "caller.gd" and node.get("source_file") == "caller.gd"
+    )
+    messages = [item["message"] for item in caller_file["metadata"]["godot_script"]["resolution_diagnostics"]]
+    assert any("Computed load path" in message for message in messages)
+    assert any("Dynamic call remains unresolved" in message for message in messages)
+    assert any("Dynamic call_deferred remains unresolved" in message for message in messages)
+    assert any("runtime group membership" in message for message in messages)
+    assert any("runtime group lookup" in message for message in messages)
+    assert any("Runtime set_script()" in message for message in messages)
+    assert any("Runtime add_child()" in message for message in messages)
+    assert any("callback remains dynamic" in message for message in messages)
 
 
 @_needs_gdscript

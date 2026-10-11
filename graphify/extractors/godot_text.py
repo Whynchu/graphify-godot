@@ -807,6 +807,10 @@ def extract_godot_text(path: Path, *, root: Path | None = None) -> dict:
                 prop["name"][:120]: _summarize_value(prop["value"])[0]
                 for prop in resource_props[:_MAX_PROPERTIES]
             },
+            "godot_property_lines": {
+                prop["name"][:120]: prop["line"]
+                for prop in resource_props[:_MAX_PROPERTIES]
+            },
             "godot_references": [ref for ref in references if ref["owner_key"] == "resource"],
         })
     else:
@@ -824,15 +828,18 @@ def extract_godot_text(path: Path, *, root: Path | None = None) -> dict:
     for sub in sub_resources:
         properties = sub["properties"]
         summary = {}
+        property_lines = {}
         property_diagnostics = []
         for prop in properties[:_MAX_PROPERTIES]:
             parsed, messages = _summarize_value(prop["value"])
             summary[prop["name"][:120]] = parsed
+            property_lines[prop["name"][:120]] = prop["line"]
             property_diagnostics.extend(messages)
         sub_key = f"sub:{sub['id']}"
         add_entity(sub_key, local_ids[sub_key], f"{sub['id']} ({sub['type']})".strip(), "sub_resource", sub["line"], {
             "godot_resource_type": sub["type"],
             "godot_properties": summary,
+            "godot_property_lines": property_lines,
             "godot_references": [ref for ref in references if ref["owner_key"] == sub_key],
             "godot_value_diagnostics": property_diagnostics[:30],
         })
@@ -840,10 +847,12 @@ def extract_godot_text(path: Path, *, root: Path | None = None) -> dict:
     for section, full_path, parent_path in scene_sections:
         local_key = f"node:{full_path}"
         props_summary = {}
+        property_lines = {}
         value_diagnostics = []
         for prop in section.properties[:_MAX_PROPERTIES]:
             parsed, messages = _summarize_value(prop["value"])
             props_summary[prop["name"][:120]] = parsed
+            property_lines[prop["name"][:120]] = prop["line"]
             value_diagnostics.extend(messages)
         node_attrs = {
             "godot_scene_path": full_path,
@@ -851,6 +860,7 @@ def extract_godot_text(path: Path, *, root: Path | None = None) -> dict:
             "godot_parent_path": parent_path[:500],
             "godot_unique_id": _decoded_attr(section, "unique_id")[:100],
             "godot_properties": props_summary,
+            "godot_property_lines": property_lines,
             "godot_references": [ref for ref in references if ref["owner_key"] == local_key],
             "godot_value_diagnostics": value_diagnostics[:30],
         }
@@ -905,5 +915,170 @@ def extract_godot_text(path: Path, *, root: Path | None = None) -> dict:
                 "source_location": f"L{item['line']}",
             }
             for item in diagnostics
+        ],
+    }
+
+
+def extract_godot_project(path: Path, *, root: Path | None = None) -> dict:
+    """Extract project identity, main-scene, autoload, and plugin settings."""
+    try:
+        raw = _read_source_bytes(path)
+    except OSError as exc:
+        return {"nodes": [], "edges": [], "error": str(exc)}
+    if len(raw) > _MAX_SOURCE_BYTES:
+        return {"nodes": [], "edges": [], "error": f"Godot project settings exceed {_MAX_SOURCE_BYTES} byte limit"}
+
+    source_file = str(path)
+    context = godot_project_context(path, root)
+    sections, diagnostics = _parse_sections(raw.decode("utf-8", errors="replace"))
+    section_map = {section.kind: section for section in sections}
+    application = section_map.get("application")
+    application_values = {prop["name"]: prop for prop in application.properties} if application else {}
+    project_name = _decode_string(application_values.get("config/name", {}).get("value", "")) or path.parent.name
+    main_scene = _decode_string(application_values.get("run/main_scene", {}).get("value", "")) or ""
+    main_scene_line = int(application_values.get("run/main_scene", {}).get("line") or 1)
+    file_id = _make_id(source_file)
+    project_id = _make_id(file_id, "godot_project", project_name)
+    project_facts: dict = {
+        "schema": 1,
+        "file_kind": "project",
+        "project_id": context["project_id"],
+        "res_path": context["res_path"],
+        "main_scene": main_scene[:500],
+        "main_scene_line": main_scene_line,
+        "autoloads": [],
+        "plugins": [],
+        "diagnostics": diagnostics[:100],
+    }
+
+    nodes = [{
+        "id": file_id,
+        "label": path.name,
+        "file_type": "code",
+        "source_file": source_file,
+        "source_location": "L1" if raw else None,
+        "metadata": {
+            "godot_kind": "file",
+            "godot_project_id": context["project_id"],
+            "godot_res_path": context["res_path"],
+            "godot_text": project_facts,
+        },
+    }, {
+        "id": project_id,
+        "label": project_name[:180],
+        "file_type": "code",
+        "source_file": source_file,
+        "source_location": f"L{application.line}" if application else "L1",
+        "metadata": {
+            "godot_kind": "godot_project",
+            "godot_local_key": "project",
+            "godot_project_id": context["project_id"],
+            "godot_res_path": context["res_path"],
+        },
+    }]
+    edges = [{
+        "source": file_id,
+        "target": project_id,
+        "relation": "contains",
+        "confidence": "EXTRACTED",
+        "source_file": source_file,
+        "source_location": _source_location(application.line if application else 1),
+        "weight": 1.0,
+    }]
+
+    def add_project_entity(local_key: str, entity_id: str, label: str, kind: str, line: int, metadata: dict) -> dict:
+        node = {
+            "id": entity_id,
+            "label": label[:180],
+            "file_type": "code",
+            "source_file": source_file,
+            "source_location": _source_location(line),
+            "metadata": {
+                "godot_kind": kind,
+                "godot_local_key": local_key,
+                "godot_project_id": context["project_id"],
+                "godot_res_path": context["res_path"],
+                **metadata,
+            },
+        }
+        nodes.append(node)
+        edges.append({
+            "source": project_id,
+            "target": entity_id,
+            "relation": "contains",
+            "confidence": "EXTRACTED",
+            "source_file": source_file,
+            "source_location": _source_location(line),
+            "weight": 1.0,
+        })
+        return node
+
+    if main_scene:
+        add_project_entity(
+            "setting:application/run/main_scene",
+            _make_id(project_id, "setting", "application/run/main_scene"),
+            "application/run/main_scene",
+            "project_setting",
+            main_scene_line,
+            {"godot_setting_value": main_scene[:500]},
+        )
+        project_facts["main_scene_key"] = "setting:application/run/main_scene"
+
+    autoload_section = section_map.get("autoload")
+    if autoload_section:
+        for prop in autoload_section.properties[:_MAX_PROPERTIES]:
+            value = _decode_string(prop["value"]) or prop["value"].strip()
+            singleton = value.startswith("*")
+            resource_path = value[1:] if singleton else value
+            if not resource_path:
+                diagnostics.append({"kind": "godot_project_parse_error", "line": prop["line"], "message": f"Autoload {prop['name']!r} has an empty path."})
+                continue
+            local_key = f"autoload:{prop['name']}"
+            add_project_entity(
+                local_key,
+                _make_id(project_id, "autoload", prop["name"]),
+                prop["name"],
+                "project_autoload",
+                prop["line"],
+                {"godot_autoload_path": resource_path[:500], "godot_autoload_singleton": singleton},
+            )
+            project_facts["autoloads"].append({
+                "name": prop["name"][:160],
+                "path": resource_path[:500],
+                "singleton": singleton,
+                "line": prop["line"],
+                "key": local_key,
+            })
+
+    plugin_section = section_map.get("editor_plugins")
+    enabled_plugins = next((prop for prop in plugin_section.properties if prop["name"] == "enabled"), None) if plugin_section else None
+    if enabled_plugins:
+        raw_value = enabled_plugins["value"]
+        quoted = re.findall(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', raw_value)
+        plugin_paths = [decoded for token in quoted if (decoded := _decode_string(token)) and decoded.startswith("res://")]
+        for index, plugin_path in enumerate(dict.fromkeys(plugin_paths)):
+            local_key = f"plugin:{index}:{plugin_path}"
+            add_project_entity(
+                local_key,
+                _make_id(project_id, "plugin", plugin_path),
+                plugin_path.rsplit("/", 1)[-1].removesuffix(".cfg"),
+                "project_plugin",
+                enabled_plugins["line"],
+                {"godot_plugin_path": plugin_path[:500]},
+            )
+            project_facts["plugins"].append({"path": plugin_path[:500], "line": enabled_plugins["line"], "key": local_key})
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "godot_facts": project_facts,
+        "diagnostics": [
+            {
+                "kind": item["kind"],
+                "message": item["message"],
+                "source_file": source_file,
+                "source_location": f"L{item['line']}",
+            }
+            for item in diagnostics[:100]
         ],
     }
