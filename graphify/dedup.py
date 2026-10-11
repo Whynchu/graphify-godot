@@ -18,12 +18,38 @@ from rapidfuzz.distance import DamerauLevenshtein, Jaro, JaroWinkler
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _is_label_char(ch: str) -> bool:
+    """True for a character that belongs to a word in a label.
+
+    Letters and digits, plus combining marks (Unicode category M*). ``\\w`` does
+    not match marks, so the old ``[\\W_]+`` separator class deleted every vowel
+    sign and virama: ``हिंदी`` became ``ह द`` and ``कि``/``की``/``के`` all
+    collapsed to ``क``, merging distinct words.
+    """
+    return ch.isalnum() or unicodedata.category(ch).startswith("M")
+
+
 def _norm(label: str | None) -> str:
-    """Lowercase + collapse non-alphanumeric runs to space (Unicode-aware)."""
+    """Lowercase + collapse non-word runs to space (Unicode-aware).
+
+    Combining marks stay part of the word (see ``_is_label_char``); punctuation,
+    underscores and whitespace collapse to a single space as before. Known gap:
+    ZWJ/ZWNJ (category Cf) still count as separators.
+    """
     if not isinstance(label, str):
         label = "" if label is None else str(label)
-    label = unicodedata.normalize("NFKC", label)
-    return re.sub(r"[\W_]+", " ", label.casefold(), flags=re.UNICODE).strip()
+    label = unicodedata.normalize("NFKC", label).casefold()
+    out: list[str] = []
+    pending_sep = False
+    for ch in label:
+        if _is_label_char(ch):
+            if pending_sep and out:
+                out.append(" ")
+            pending_sep = False
+            out.append(ch)
+        else:
+            pending_sep = True
+    return "".join(out)
 
 
 def _entropy(label: str) -> float:
@@ -402,13 +428,16 @@ def _lifecycle_penalty(rank_path: str) -> int:
 def _rank_path(source_file: str, root: Path | None) -> str:
     """The root-relative form of ``source_file`` used for collision ranking.
 
-    Mirrors ``_source_key`` in extractors/resolution.py: with a scan root, an
-    absolute stored path and its repo-relative twin rank identically, and the
-    checkout location's own segments never participate (#2532). Without a root
-    (or when relativizing fails) the normalized stored path is used as-is.
+    With a scan root, an absolute stored path and its repo-relative twin rank
+    identically, and the checkout location's own segments never participate
+    (#2532). A relative stored path is already root-relative and is used as-is;
+    unlike ``_source_key`` in extractors/resolution.py, it is not resolved
+    against the CWD, so a run from a subdirectory of the root keys it the same
+    (#4281). Without a root (or when relativizing fails) the normalized stored
+    path is used as-is.
     """
     normalized = source_file.replace("\\", "/")
-    if root is not None and normalized:
+    if root is not None and normalized and Path(normalized).is_absolute():
         try:
             return Path(normalized).resolve().relative_to(root).as_posix()
         except Exception:

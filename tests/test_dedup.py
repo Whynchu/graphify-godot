@@ -1622,3 +1622,74 @@ def test_build_with_absolute_edge_paths_moves_edges_to_renamed_node(tmp_path):
     assert "firmware_lib_portal" in G and "firmware_lib_portal_html" in G
     assert G.has_edge("firmware_lib_portal_html", "card_a")
     assert not G.has_edge("firmware_lib_portal", "card_a")
+
+
+# ── combining marks in normalization ─────────────────────────────────────────
+# `_norm` used `[\W_]+` as its separator class. Combining marks (Mn/Mc: vowel
+# signs, viramas) are not `\w`, so they were deleted as if they were
+# punctuation, and distinct Indic-script words collapsed to one key.
+
+def test_norm_keeps_combining_marks():
+    from graphify.dedup import _norm
+    assert _norm("हिंदी") == "हिंदी"
+    assert _norm("தமிழ்") == "தமிழ்"
+    # Marks are kept, separators still collapse.
+    assert _norm("हिंदी - भाषा_नोट") == "हिंदी भाषा नोट"
+
+
+def test_norm_still_separates_punctuation_for_latin():
+    from graphify.dedup import _norm
+    assert _norm("  Graph--Extractor__v2! ") == "graph extractor v2"
+    # NFKC still composes a decomposed accent into the letter, mark included.
+    assert _norm("Cafe\u0301 Menu") == "caf\u00e9 menu"
+
+
+def test_distinct_indic_words_are_not_exact_merged():
+    """कि / की / के differ only by vowel sign; they used to share the key 'क'."""
+    nodes = [
+        {"id": "h1", "label": "कि", "source_file": "a.md", "file_type": "concept"},
+        {"id": "h2", "label": "की", "source_file": "a.md", "file_type": "concept"},
+        {"id": "h3", "label": "के", "source_file": "a.md", "file_type": "concept"},
+    ]
+    out, _ = deduplicate_entities(nodes, [], communities={})
+    assert sorted(n["id"] for n in out) == ["h1", "h2", "h3"]
+
+
+def test_identical_indic_labels_still_exact_merge():
+    nodes = [
+        {"id": "h1", "label": "हिंदी भाषा", "source_file": "a.md", "file_type": "concept"},
+        {"id": "h2", "label": "हिंदी  भाषा", "source_file": "a.md", "file_type": "concept"},
+    ]
+    out, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out) == 1
+
+
+def test_build_from_subdirectory_moves_edges_to_renamed_node(tmp_path, monkeypatch):
+    """Nodes are root-relative by dedup time; run from a subdirectory of the root, a
+    relative path must not be resolved against the CWD, or the renamed node's key
+    stops matching its edges' and they stay on the survivor (#4281)."""
+    from graphify.build import build
+
+    root = tmp_path
+    (root / "firmware").mkdir()
+    monkeypatch.chdir(root / "firmware")
+    py = str(root / "firmware" / "lib" / "portal.py")
+    html = str(root / "firmware" / "lib" / "portal.html")
+    ext = {
+        "nodes": [
+            {"id": "firmware_lib_portal", "label": "portal.py", "file_type": "code",
+             "source_file": py},
+            {"id": "firmware_lib_portal", "label": "Portal page", "file_type": "document",
+             "source_file": html},
+            {"id": "card_a", "label": "Card A", "file_type": "document", "source_file": html},
+        ],
+        "edges": [
+            {"source": "firmware_lib_portal", "target": "card_a", "relation": "references",
+             "confidence": "EXTRACTED", "source_file": html},
+        ],
+    }
+    G = build([ext], root=str(root))
+
+    assert "firmware_lib_portal" in G and "firmware_lib_portal_html" in G
+    assert G.has_edge("firmware_lib_portal_html", "card_a")
+    assert not G.has_edge("firmware_lib_portal", "card_a")

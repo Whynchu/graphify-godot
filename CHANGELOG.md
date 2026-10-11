@@ -2,6 +2,28 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.86 (2026-10-11)
+
+Eighteen community pull requests: language-extraction fixes, safety and determinism hardening, and CLI/query ergonomics.
+
+- Safety: `graphify uninstall --purge` now refuses to delete the project (or home, or a filesystem root) when `GRAPHIFY_OUT` is empty or `.`, instead of silently removing the working tree (#4329, thanks @Hassannzidan).
+- Fix: **Julia** now extracts return-typed, qualified (`Base.show`), operator (`Base.:+`) and functor (callable-struct) methods, and resolves broadcast (`f.(xs)`) and pipe (`x |> f`) calls (#4310, thanks @ayarodionov).
+- Fix: **Rust** grouped `use` declarations (`use a::{b, c::d}`) now expand into one import binding per name, instead of a single edge to the common prefix (#4135, thanks @krishhgg). (The AST cache schema is bumped, so the first build after upgrading re-extracts.)
+- Fix: **Scala 3** `class Foo derives Bar` now links the class to each derived typeclass (#2048, #4173, thanks @Mpasha17).
+- Fix: **Codex** semantic chunks are no longer clobbered by the shared B3 merge (each chunk is written to its own file, matching the other hosts), so semantic nodes/edges survive (#4311, #4312, thanks @vibhanshu-mishra).
+- Fix: `affected <Symbol>` now also walks callers of the supertype member that an overriding method overrides, so a change to an override surfaces users of the base contract (#4330, #4331, thanks @rohit-jsfreaky).
+- Fix: dedup keeps combining marks in label normalization, so distinct Indic-script words no longer collapse to one node (#4317, #4318, thanks @Suraj370).
+- Fix: dedup ranks a relative `source_file` against the scan root rather than the CWD, so building from a subdirectory no longer strands an extension-renamed node's edges on the survivor (#4281, #4326, thanks @Deepjyoti-Sarmah).
+- Fix: the global (cross-repo) graph preserves stored edge direction on `global add`, so `path` and other direction-aware readers no longer follow reversed arcs (#4066, #4138, thanks @e4c5).
+- Fix: graphify now respects git's global ignore file (`core.excludesFile`), with git-faithful precedence and `~`/XDG expansion (#4335, #4339, thanks @smngvlkz).
+- Fix: null token counts from a backend are coerced to 0 across all backends, instead of crashing a chunk with a `TypeError` (#4325, #4340, thanks @rtmalikian).
+- Feature: built-in Ollama requests accept a sampling seed for reproducible extraction (#4168, thanks @oleksii-tumanov).
+- Fix: `explain` refuses a name carried by several nodes of one file (ambiguous within a file) instead of silently picking one (#4320, thanks @alexwrite).
+- Fix: lookups now return distinct exit codes — 0 for an answer, 3 for an ambiguous name, 4 for a missing one — so scripts can tell a miss from a hit (#4321, thanks @alexwrite).
+- Fix: `explain`/`query` tell you how to get the full answer (and add `explain --all`) when the output is truncated to the token budget (#4323, thanks @alexwrite).
+- Change: a committed `graph.json` is now written as one line of compact JSON, so re-running a build produces a `+1/-1` diff instead of a large whitespace churn (#3413, #4319, thanks @andrebrait).
+- Docs: the always-on guidance explains that large `graph.json` diffs in pull requests are expected (#4324, thanks @andrebrait), and the README distinguishes local CLI skill guidance from MCP instructions (#3925, #4292, thanks @Tivonsico).
+
 ## 0.9.85 (2026-10-10)
 
 A language-extraction and tooling batch: six extractor/exporter fixes picked from open issues, plus fourteen community pull requests.

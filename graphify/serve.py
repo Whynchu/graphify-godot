@@ -1260,12 +1260,16 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
         # for a complete one — silence used to read as absence (#BUG2). The
         # notice + end marker sit OUTSIDE char_budget by design (two bounded
         # wrapper lines, like the existing end marker).
+        # Smallest budget whose cut keeps every NODE line; past that, edges are never dropped.
+        node_chars = sum(len(l) + 1 for l in lines if l.startswith("NODE "))
+        full_budget = (min(node_chars, len(output)) + 2) // 3
         output = (
             f"[!] TRUNCATED: showing {shown_nodes} of {total_nodes} nodes "
             f"(~{token_budget}-token budget). The answer may be among the "
-            f"{cut_count} cut nodes — raise the token budget (CLI: --budget) or "
-            f"narrow the query (e.g. context_filter=['call'], or get_node for a "
-            f"specific symbol).\n\n"
+            f"{cut_count} cut nodes — raise the token budget to {full_budget} to get "
+            f"all {total_nodes} (CLI: --budget {full_budget}, MCP: "
+            f"token_budget={full_budget}) or narrow the query (e.g. "
+            f"context_filter=['call'], or get_node for a specific symbol).\n\n"
             + output[:cut_at]
             + f"\n... (truncated — {cut_count} more nodes cut by ~{token_budget}-token budget."
             f" Narrow with context_filter=['call'] or use get_node for a specific symbol)"
@@ -1286,12 +1290,14 @@ def _cut_lines_to_budget(lines: list[str], token_budget: int, narrow_hint: str) 
     kept = output[:cut_at]
     shown = kept.count("\n") + 1
     cut_count = len(lines) - shown
+    full_budget = (len(output) + 2) // 3
     # Announce truncation at the TOP as well, matching _subgraph_to_text — a
     # bottom-only marker reads as silence/absence (the BUG-2 fix rationale). The
     # notice sits outside char_budget by design (one bounded wrapper line).
     return (
         f"[!] TRUNCATED: showing {shown} of {len(lines)} lines "
-        f"(~{token_budget}-token budget). {narrow_hint}\n\n"
+        f"(~{token_budget}-token budget). Raise the token budget to {full_budget} "
+        f"to get all {len(lines)} (token_budget={full_budget}). {narrow_hint}\n\n"
         + kept
         + f"\n... (truncated — {cut_count} more lines cut by ~{token_budget}-token budget. "
         + narrow_hint
@@ -1370,6 +1376,9 @@ def _traversal_view(G: nx.Graph) -> nx.Graph:
     G.graph["_traversal_view"] = H
     return H
 
+_QUERY_NO_MATCH = "No matching nodes found."
+
+
 def _query_graph_text(
     G: nx.Graph,
     question: str,
@@ -1403,7 +1412,7 @@ def _query_graph_text(
         }
     start_nodes = _pick_seeds(qs.ranked, G=G, best_seed_by_term=best_seed_by_term)
     if not start_nodes:
-        return "No matching nodes found."
+        return _QUERY_NO_MATCH
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
     traversal_graph = _filter_graph_by_context(_traversal_view(G), resolved_filters)
     nodes, edges = _dfs(traversal_graph, start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, start_nodes, depth)
@@ -1652,21 +1661,46 @@ def _rivals_across_files(G: nx.Graph, tier: list[str]) -> list[str]:
 
 
 def _resolve_single_node(G: nx.Graph, label: str) -> tuple[str | None, str | None]:
-    """Shared node resolution for the get_node / get_neighbors tools.
+    """Shared node resolution for `explain` and the get_node / get_neighbors tools.
 
     Returns ``(node_id, None)`` when *label* resolves to a single winner via the
     tiered `_find_node` ranking, or ``(None, message)`` when there is no match or
-    the winning tier spans several source files. Routing both tools through this
-    keeps get_node from silently returning a `G.nodes()` iteration-order match for
-    a hub name while get_neighbors reports the same lookup as ambiguous (#ADR-0001).
+    the winning tier holds several nodes, in different files or in one, as the
+    `path` endpoints refuse them. Routing both tools through this keeps get_node
+    from silently returning a `G.nodes()` iteration-order match for a hub name
+    while get_neighbors reports the same lookup as ambiguous (#ADR-0001).
     """
-    matches = _find_node(G, label)
-    if not matches:
+    source_exact, exact, prefix, substring = _find_node_tiers(G, label)
+    tier = source_exact or exact or prefix or substring
+    if not tier:
         return None, f"No node matching '{label}' found."
-    rivals = find_node_ambiguity(G, label)
+    refusal = _tier_refusal(G, label, tier, file_query=bool(source_exact) and "::" not in label)
+    if refusal:
+        return None, refusal
+    return tier[0], None
+
+
+def _tier_refusal(G: nx.Graph, label: str, tier: list[str], *, file_query: bool) -> str | None:
+    """Refusal message when the winning *tier* names more than one node, else None.
+
+    Shared by `explain`, get_node / get_neighbors and the `path` endpoints so all
+    of them refuse the same lookups. A file-path query is the one exception: its
+    tier is the file node followed by its members, which is precedence, not a tie.
+    """
+    rivals = _rivals_across_files(G, tier)
     if rivals:
-        return None, _ambiguity_message(G, label, rivals)
-    return matches[0], None
+        return _ambiguity_message(G, label, rivals)
+    if len(tier) > 1 and not file_query:
+        return _same_file_ambiguity_message(G, label, tier)
+    return None
+
+
+_AMBIGUOUS = "Ambiguous: "
+
+
+def _is_ambiguity_refusal(message: str | None) -> bool:
+    """True for a refusal that lists candidates, False for a miss (no node matched)."""
+    return message is not None and message.startswith(_AMBIGUOUS)
 
 
 def _ambiguity_message(G: nx.Graph, label: str, rivals: list[str]) -> str:
@@ -1677,7 +1711,7 @@ def _ambiguity_message(G: nx.Graph, label: str, rivals: list[str]) -> str:
     # nest a path-scoped one (`index.ts::foo()`) behind a second path.
     symbol = G.nodes[rivals[0]].get("label") or label
     return (
-        f"Ambiguous: '{label}' matches {len(rivals)} nodes in different files.\n"
+        f"{_AMBIGUOUS}'{label}' matches {len(rivals)} nodes in different files.\n"
         f"{listing}\n"
         f"Retry with path::symbol using one of the paths above (e.g. "
         f"<path>::{symbol}) or the full node id."
@@ -1692,7 +1726,7 @@ def _same_file_ambiguity_message(G: nx.Graph, label: str, hits: list[str]) -> st
         for h in hits
     )
     return (
-        f"Ambiguous: '{label}' matches {len(hits)} nodes {where}.\n"
+        f"{_AMBIGUOUS}'{label}' matches {len(hits)} nodes {where}.\n"
         f"{listing}\n"
         f"Retry with the full node id."
     )
@@ -1754,14 +1788,13 @@ def _resolve_path_endpoint(
     source_exact, exact, _, _ = _find_node_tiers(G, query)
     hits = source_exact or exact
     if hits:
-        rivals = _rivals_across_files(G, hits)
-        if rivals:
-            return None, [], _ambiguity_message(G, query, rivals)
         # A `path::symbol` hit also lands in `source_exact`; only a plain path
         # query makes that tier a file lookup.
-        file_query = bool(source_exact) and "::" not in query
-        if len(hits) > 1 and not file_query:
-            return None, [], _same_file_ambiguity_message(G, query, hits)
+        refusal = _tier_refusal(
+            G, query, hits, file_query=bool(source_exact) and "::" not in query
+        )
+        if refusal:
+            return None, [], refusal
         return hits[0], [], None
     # A deliberately file-scoped endpoint (`file::symbol`) that matched no symbol
     # in that file must NOT fall back to scoring the bare name across other files
