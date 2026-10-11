@@ -37,7 +37,7 @@ except Exception:
     _EXTRACTOR_VERSION = "unknown"
 
 # Bump when AST cache-key semantics change independently of the package version.
-_AST_CACHE_SCHEMA = 7  # Python opaque-base/super(args) raw-call markers and nested-class enclosing ids.
+_AST_CACHE_SCHEMA = 8  # Godot project/resource context and authored text-resource facts.
 
 
 # Per-process memo: distributions() scans site-packages metadata, which is
@@ -286,7 +286,11 @@ def _mtime_granularity_ns() -> int:
     return _MTIME_GRANULARITY_NS
 
 
-def _stat_sig_fresh(entry: object, st: "os.stat_result") -> bool:
+def _stat_sig_fresh(
+    entry: object,
+    st: "os.stat_result",
+    dependency_sig: str | None = None,
+) -> bool:
     """True if ``entry`` provably describes the file's CURRENT content.
 
     Beyond matching (size, mtime_ns), the entry must be *racily clean* in git's
@@ -307,6 +311,8 @@ def _stat_sig_fresh(entry: object, st: "os.stat_result") -> bool:
     if not isinstance(entry, dict):
         return False
     if entry.get("size") != st.st_size or entry.get("mtime_ns") != st.st_mtime_ns:
+        return False
+    if dependency_sig is not None and entry.get("dependency_sig") != dependency_sig:
         return False
     indexed_at = entry.get("indexed_at_ns")
     if not isinstance(indexed_at, int):
@@ -508,6 +514,23 @@ def _normalize_path(path: Path) -> Path:
     return Path(os.path.normcase(s))
 
 
+def _godot_uid_dependency_signature(path: Path) -> str | None:
+    """Fingerprint the adjacent Godot UID sidecar used by text extractors."""
+    if path.suffix.lower() not in {".gd", ".tres", ".tscn"}:
+        return None
+    sidecar = Path(str(path) + ".uid")
+    try:
+        if sidecar.stat().st_size > 2_048:
+            payload = b"oversized"
+        else:
+            payload = sidecar.read_bytes()
+    except FileNotFoundError:
+        payload = b"absent"
+    except OSError:
+        payload = b"unreadable"
+    return hashlib.sha256(b"godot-uid-sidecar\0" + payload).hexdigest()
+
+
 def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = None) -> str:
     """SHA256 of file contents + path relative to root.
 
@@ -522,6 +545,9 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
     and checkout directories. Falls back to the resolved path when the walked
     path cannot be expressed relative to root.
 
+    For Godot .gd, .tres, and .tscn files, the adjacent .uid sidecar signature
+    is included because it affects extracted identity and resource resolution.
+
     For Markdown files (.md), only the body below the YAML frontmatter is hashed,
     so metadata-only changes (e.g. reviewed, status, tags) do not invalidate the cache.
     """
@@ -530,6 +556,7 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
     root = _normalize_path(Path(root))
     if not p.is_file():
         raise IsADirectoryError(f"file_hash requires a file, got: {p}")
+    dependency_sig = _godot_uid_dependency_signature(p)
 
     # The stat index is a cache artifact, so it must follow the cache location
     # (cache_root), not the key-anchor root — otherwise it leaves a stray
@@ -578,7 +605,7 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
     st: "os.stat_result | None" = None
     try:
         st = p.stat()
-        if _stat_sig_fresh(_stat_index.get(abs_key), st):
+        if _stat_sig_fresh(_stat_index.get(abs_key), st, dependency_sig):
             hashes = _stat_index[abs_key].get("hashes")
             if isinstance(hashes, dict):
                 cached = hashes.get(salt)
@@ -596,12 +623,17 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
     content = _body_content(raw) if p.suffix.lower() == ".md" else raw
     h = hashlib.sha256()
     h.update(content)
+    if dependency_sig is not None:
+        h.update(b"\x00")
+        h.update(dependency_sig.encode("ascii"))
     h.update(b"\x00")
     h.update(salt.encode())
     digest = h.hexdigest()
 
     if st is not None:
         entry = _stat_entry_for(abs_key, st, observed_at_ns)
+        if dependency_sig is not None:
+            entry["dependency_sig"] = dependency_sig
         hashes = entry.get("hashes")
         if not isinstance(hashes, dict):
             hashes = {}

@@ -52,6 +52,8 @@ from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.erlang import extract_erlang, resolve_erlang_remote_calls  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.gdscript import extract_gdscript  # noqa: F401
+from graphify.extractors.godot_text import extract_godot_text  # noqa: F401
+from graphify.godot_resolution import resolve_godot_resources
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
@@ -193,7 +195,7 @@ def _safe_extract(
     extractor: Callable, path: Path, *, scan_root: Path | None = None
 ) -> dict:
     try:
-        if extractor is extract_python:
+        if extractor in (extract_python, extract_gdscript, extract_godot_text):
             return extractor(path, root=scan_root)
         return extractor(path)
     except RecursionError:
@@ -3419,6 +3421,8 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".py": "python",
     ".go": "go",
     ".gd": "gdscript",
+    ".tres": "gdscript",
+    ".tscn": "gdscript",
     ".rs": "rust",
     ".cbl": "cobol", ".cob": "cobol", ".cobol": "cobol", ".cpy": "cobol",
     ".r": "r",
@@ -6168,6 +6172,13 @@ register_language_resolver(
     LanguageResolver("terraform_modules", frozenset({".tf"}), resolve_terraform_modules)
 )
 register_language_resolver(
+    LanguageResolver(
+        "godot_resource_links",
+        frozenset({".gd", ".tres", ".tscn"}),
+        resolve_godot_resources,
+    )
+)
+register_language_resolver(
     LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
 )
 register_language_resolver(
@@ -7318,6 +7329,8 @@ def extract_xaml(path: Path) -> dict:
 
 _DISPATCH: dict[str, Any] = {
     ".gd": extract_gdscript,
+    ".tres": extract_godot_text,
+    ".tscn": extract_godot_text,
     ".py": extract_python,
     ".js": extract_js,
     ".jsx": extract_js,

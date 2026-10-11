@@ -34,6 +34,28 @@ def test_file_hash_changes(tmp_path):
     assert file_hash(f1) != file_hash(f2)
 
 
+def test_godot_uid_sidecar_invalidates_extraction_cache_key(tmp_path):
+    script = tmp_path / "linked.gd"
+    sidecar = tmp_path / "linked.gd.uid"
+    script.write_text("class_name Linked\n", encoding="utf-8")
+    sidecar.write_text("uid://first\n", encoding="utf-8")
+
+    cache = tmp_path / "cache"
+    result = {"nodes": [{"id": "linked", "label": "linked.gd"}], "edges": []}
+    save_cached(script, result, root=tmp_path, cache_root=cache)
+    first = file_hash(script, root=tmp_path, cache_root=cache)
+    assert load_cached(script, root=tmp_path, cache_root=cache) == result
+    assert file_hash(script, root=tmp_path, cache_root=cache) == first
+    sidecar.write_text("uid://second\n", encoding="utf-8")
+    second = file_hash(script, root=tmp_path, cache_root=cache)
+    assert load_cached(script, root=tmp_path, cache_root=cache) is None
+    sidecar.unlink()
+    absent = file_hash(script, root=tmp_path, cache_root=cache)
+
+    assert second != first
+    assert absent != second
+
+
 def test_cache_roundtrip(tmp_file, cache_root):
     """Save then load returns the same result dict."""
     result = {"nodes": [{"id": "n1", "label": "Node1"}], "edges": []}

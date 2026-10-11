@@ -7,6 +7,7 @@ from pathlib import Path
 
 from graphify.extractors.base import _file_stem, _make_id, _read_source_bytes
 from graphify.extractors.engine import _extract_generic
+from graphify.extractors.godot_text import godot_project_context, read_uid_sidecar
 from graphify.extractors.models import LanguageConfig
 
 
@@ -24,7 +25,7 @@ def _node_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
 
-def _add_script_metadata(path: Path, source: bytes, result: dict) -> None:
+def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Path | None = None) -> None:
     """Record script classes and exported property declarations for later linking."""
     try:
         from tree_sitter import Language, Parser
@@ -75,13 +76,19 @@ def _add_script_metadata(path: Path, source: bytes, result: dict) -> None:
     ]
 
     stem = _file_stem(path)
+    project_context = godot_project_context(path, scan_root)
+    script_uid = read_uid_sidecar(path)
     display_name = class_name or path.stem
     script_class_id = _make_id(stem, "script_class", display_name)
     class_line = (class_name_node or root).start_point[0] + 1
     class_metadata = {
         "godot_kind": "script_class",
         "godot_global_class": bool(class_name),
+        "godot_project_id": project_context["project_id"],
+        "godot_res_path": project_context["res_path"],
     }
+    if script_uid:
+        class_metadata["godot_uid"] = script_uid
     if base_type:
         class_metadata["godot_base_type"] = base_type[:200]
 
@@ -104,6 +111,13 @@ def _add_script_metadata(path: Path, source: bytes, result: dict) -> None:
     })
 
     file_metadata = dict(file_node.get("metadata") or {})
+    file_metadata.update({
+        "godot_kind": "file",
+        "godot_project_id": project_context["project_id"],
+        "godot_res_path": project_context["res_path"],
+    })
+    if script_uid:
+        file_metadata["godot_uid"] = script_uid
     script_metadata = {"class_label": display_name, "global_class": bool(class_name)}
     if class_name:
         script_metadata["class_name"] = class_name
@@ -220,5 +234,5 @@ def extract_gdscript(path: Path, *, root: Path | None = None) -> dict:
         scan_root=root,
     )
     if not result.get("error"):
-        _add_script_metadata(path, source, result)
+        _add_script_metadata(path, source, result, root)
     return result

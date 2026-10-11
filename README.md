@@ -284,7 +284,7 @@ Codex users also need `multi_agent = true` under `[features]` in `~/.codex/confi
 | `bedrock` | AWS Bedrock (uses IAM, no API key) | `uv tool install "graphifyy[bedrock]"` |
 | `azure` | Azure OpenAI Service (`--backend azure`, uses `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT`) | `uv tool install "graphifyy[openai]"` |
 | `sql` | SQL schema extraction | `uv tool install "graphifyy[sql]"` |
-| `godot` | GDScript `.gd` script classes, methods, and exported property declarations | `uv tool install "graphifyy[godot]"` |
+| `godot` | GDScript `.gd` classes, methods, and exported properties, plus `.tres` resources and `.tscn` scenes with resource, script-attachment, scene-instance, hierarchy, and serialized signal links | `uv tool install "graphifyy[godot]"` |
 | `postgres` | Live PostgreSQL introspection (`--postgres DSN`) | `uv tool install "graphifyy[postgres]"` |
 | `dm` | BYOND DreamMaker `.dm`/`.dme` AST extraction (may need a C compiler + `python3-dev` if no wheel matches your platform) | `uv tool install "graphifyy[dm]"` |
 | `terraform` | Terraform / HCL `.tf`/`.tfvars`/`.hcl` AST extraction | `uv tool install "graphifyy[terraform]"` |
