@@ -72,6 +72,7 @@ from graphify.extractors.solidity import (  # noqa: F401
 )
 from graphify.extractors.sql import extract_sql  # noqa: F401
 from graphify.extractors.terraform import extract_terraform, prepare_terraform, resolve_terraform_modules  # noqa: F401
+from graphify.extractors.verification_manifest import extract_verification_manifest  # noqa: F401
 from graphify.extractors.verilog import extract_verilog  # noqa: F401
 from graphify.extractors.vbnet import extract_vbnet, resolve_vbnet_partial_calls  # noqa: F401
 from graphify.extractors.zig import extract_zig  # noqa: F401
@@ -7331,6 +7332,7 @@ _DISPATCH: dict[str, Any] = {
     ".gd": extract_gdscript,
     ".tres": extract_godot_text,
     ".tscn": extract_godot_text,
+    ".csv": extract_verification_manifest,
     ".py": extract_python,
     ".js": extract_js,
     ".jsx": extract_js,

@@ -37,9 +37,8 @@ except Exception:
     _EXTRACTOR_VERSION = "unknown"
 
 # Bump when AST cache-key semantics change independently of the package version.
-# Schema 9 combines both branch-local schema 8 changes: Godot UID/resource facts
-# and upstream Rust `use`-group bindings.
-_AST_CACHE_SCHEMA = 9
+# Schema 12 adds static GDScript references and portable test-inventory facts.
+_AST_CACHE_SCHEMA = 12
 
 
 # Per-process memo: distributions() scans site-packages metadata, which is

@@ -7,7 +7,11 @@ from pathlib import Path
 
 from graphify.extractors.base import _file_stem, _make_id, _read_source_bytes
 from graphify.extractors.engine import _extract_generic
-from graphify.extractors.godot_text import godot_project_context, read_uid_sidecar
+from graphify.extractors.godot_text import (
+    _decode_string,
+    godot_project_context,
+    read_uid_sidecar,
+)
 from graphify.extractors.models import LanguageConfig
 
 
@@ -18,11 +22,116 @@ _GDSCRIPT_CONFIG = LanguageConfig(
     function_boundary_types=frozenset({"function_definition"}),
 )
 
+_MAX_SCRIPT_RESOURCE_REFS = 10_000
+_MAX_SCRIPT_CLASS_REFS = 50_000
+_GODOT_SOURCE_SUFFIXES = frozenset({".gd", ".tres", ".tscn"})
+
 
 def _node_text(node, source: bytes) -> str:
     if node is None:
         return ""
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+
+def _script_reference_facts(root, source: bytes) -> tuple[list[dict], list[dict]]:
+    """Collect bounded, syntax-backed script dependencies and class references.
+
+    Resource references are limited to literal ``preload``/``load`` calls whose
+    targets are Godot source resources. Class references are collected only in
+    type, constructor, inheritance, and attribute-receiver positions; the
+    project resolver later keeps names that match a unique ``class_name``.
+    """
+    resources: list[dict] = []
+    class_refs: list[dict] = []
+    resource_seen: set[tuple[str, str, int, str]] = set()
+    class_seen: set[tuple[str, str, int]] = set()
+
+    def const_binding(node) -> str:
+        parent = node.parent
+        while parent is not None:
+            if parent.type == "const_statement":
+                return _node_text(parent.child_by_field_name("name"), source)[:160]
+            if parent.type in {"function_definition", "class_definition"}:
+                break
+            parent = parent.parent
+        return ""
+
+    def add_resource(kind: str, call_node, argument_node) -> None:
+        if argument_node is None or argument_node.type != "string":
+            return
+        raw = _node_text(argument_node, source)
+        path = _decode_string(raw)
+        if not path:
+            return
+        suffix = Path(path).suffix.lower()
+        is_godot_uri = path.startswith(("res://", "uid://"))
+        if not is_godot_uri and suffix not in _GODOT_SOURCE_SUFFIXES:
+            return
+        if path.startswith("res://") and suffix not in _GODOT_SOURCE_SUFFIXES:
+            return
+        line = call_node.start_point[0] + 1
+        binding = const_binding(call_node)
+        key = (kind, path, line, binding)
+        if key in resource_seen or len(resources) >= _MAX_SCRIPT_RESOURCE_REFS:
+            return
+        resource_seen.add(key)
+        resources.append({"kind": kind, "path": path[:500], "line": line, "binding": binding})
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        stack.extend(reversed(node.named_children))
+
+        if node.type == "call":
+            named = node.named_children
+            if len(named) >= 2 and named[0].type == "identifier":
+                kind = _node_text(named[0], source)
+                if kind in {"preload", "load"}:
+                    args = next((child for child in named[1:] if child.type == "arguments"), None)
+                    argument = args.named_children[0] if args and args.named_children else None
+                    add_resource(kind, node, argument)
+
+        elif node.type == "attribute_call" and node.parent is not None and node.parent.type == "attribute":
+            # ResourceLoader.load() is a static load boundary equivalent to
+            # load(), while avoiding guesses about arbitrary receiver methods.
+            attribute = node.parent
+            named = attribute.named_children
+            call_parts = node.named_children
+            if (
+                len(named) >= 2
+                and _node_text(named[0], source) == "ResourceLoader"
+                and call_parts
+                and _node_text(call_parts[0], source) == "load"
+            ):
+                args = next((child for child in call_parts[1:] if child.type == "arguments"), None)
+                argument = args.named_children[0] if args and args.named_children else None
+                add_resource("load", attribute, argument)
+
+        if node.type != "identifier":
+            continue
+        name = _node_text(node, source)
+        parent = node.parent
+        if not name or parent is None:
+            continue
+        ref_kind = ""
+        if parent.type == "type":
+            ref_kind = "extends" if parent.parent is not None and parent.parent.type == "extends_statement" else "type"
+        elif parent.type == "attribute" and parent.named_children and parent.named_children[0].id == node.id:
+            ref_kind = "class_receiver"
+        elif parent.type == "call" and parent.named_children and parent.named_children[0].id == node.id:
+            ref_kind = "constructor"
+        if not ref_kind:
+            continue
+        line = node.start_point[0] + 1
+        key = (name, ref_kind, line)
+        if key in class_seen or len(class_refs) >= _MAX_SCRIPT_CLASS_REFS:
+            continue
+        class_seen.add(key)
+        class_refs.append({"name": name[:160], "kind": ref_kind, "line": line})
+
+    resources.sort(key=lambda item: (item["line"], item["kind"], item["path"], item["binding"]))
+    class_refs.sort(key=lambda item: (item["line"], item["name"], item["kind"]))
+    return resources, class_refs
 
 
 def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Path | None = None) -> None:
@@ -125,6 +234,11 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
         script_metadata["extends"] = base_type[:200]
     if root_annotations:
         script_metadata["annotations"] = root_annotations
+    resource_refs, class_refs = _script_reference_facts(root, source)
+    if resource_refs:
+        script_metadata["resource_references"] = resource_refs
+    if class_refs:
+        script_metadata["class_references"] = class_refs
     file_metadata["godot_script"] = script_metadata
     file_node["metadata"] = file_metadata
 

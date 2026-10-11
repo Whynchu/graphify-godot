@@ -23,6 +23,7 @@ from graphify.google_workspace import (
     google_workspace_enabled,
 )
 from graphify.paths import GRAPHIFY_OUT, GRAPHIFY_OUT_NAME, out_path
+from graphify.verification_manifest import is_verification_manifest_csv
 
 
 class FileType(str, Enum):
@@ -526,6 +527,8 @@ def classify_file(path: Path) -> FileType | None:
     if path.name.lower().endswith(".blade.php"):
         return FileType.CODE
     ext = path.suffix.lower()
+    if ext == ".csv" and is_verification_manifest_csv(path):
+        return FileType.CODE
     if not ext:
         return _shebang_file_type(path)
     if ext in CODE_EXTENSIONS:

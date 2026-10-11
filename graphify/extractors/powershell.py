@@ -54,6 +54,88 @@ def extract_powershell(path: Path) -> dict:
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
+    # Follow the common, explicit PowerShell data-file pattern:
+    #   $manifestPath = Join-Path $PSScriptRoot "manifest.csv"
+    #   $manifest = Import-Csv -LiteralPath $manifestPath
+    # This emits an imports_from edge to the actual sibling file without trying
+    # to evaluate PowerShell or guessing paths from arbitrary variable names.
+    def descendants(node):
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            yield current
+            stack.extend(reversed(current.named_children))
+
+    def variable_name(node) -> str:
+        raw = _read_text(node, source).strip()
+        return raw[1:].casefold() if raw.startswith("$") else ""
+
+    joined_script_paths: dict[str, str] = {}
+    for assignment in descendants(root):
+        if assignment.type != "assignment_expression":
+            continue
+        left = next((child for child in assignment.named_children if child.type == "left_assignment_expression"), None)
+        rhs = next((child for child in assignment.named_children if child.type == "pipeline"), None)
+        if left is None or rhs is None:
+            continue
+        target_name = variable_name(left)
+        if not target_name:
+            continue
+        join_command = next(
+            (
+                child for child in descendants(rhs)
+                if child.type == "command"
+                and any(
+                    part.type == "command_name" and _read_text(part, source).casefold() == "join-path"
+                    for part in child.children
+                )
+            ),
+            None,
+        )
+        if join_command is None:
+            continue
+        args = list(descendants(join_command))
+        variables = [variable_name(child) for child in args if child.type == "variable"]
+        literals = [
+            _read_text(child, source).strip().strip("'\"")
+            for child in args if child.type == "string_literal"
+        ]
+        if "psscriptroot" not in variables or len(literals) != 1:
+            continue
+        relative = Path(literals[0].replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts or relative.suffix.casefold() != ".csv":
+            continue
+        joined_script_paths[target_name] = relative.as_posix()
+
+    for command in descendants(root):
+        if command.type != "command":
+            continue
+        command_name = next((child for child in command.children if child.type == "command_name"), None)
+        if command_name is None or _read_text(command_name, source).casefold() != "import-csv":
+            continue
+        args = list(descendants(command))
+        variables = [variable_name(child) for child in args if child.type == "variable"]
+        literals = [
+            _read_text(child, source).strip().strip("'\"")
+            for child in args if child.type == "string_literal"
+        ]
+        relative_csv = next((joined_script_paths[name] for name in variables if name in joined_script_paths), None)
+        if relative_csv is None:
+            relative_csv = next(
+                (value for value in literals if Path(value.replace("\\", "/")).suffix.casefold() == ".csv"),
+                None,
+            )
+        if relative_csv is None:
+            continue
+        target_path = path.parent / Path(relative_csv.replace("\\", "/"))
+        add_edge(
+            file_nid,
+            _make_id(str(target_path)),
+            "imports_from",
+            command.start_point[0] + 1,
+            context="powershell_import_csv",
+        )
+
     _PS_SKIP = frozenset({
         "using", "return", "if", "else", "elseif", "foreach", "for",
         "while", "do", "switch", "try", "catch", "finally", "throw",

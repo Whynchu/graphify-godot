@@ -111,3 +111,36 @@ def test_parser_recovery_is_retained_as_a_diagnostic(tmp_path: Path):
     diagnostic = file_node["metadata"]["godot_script"]["parser_diagnostics"][0]
     assert diagnostic["kind"] == "godot_parse_error"
     assert diagnostic["line"] == 4
+
+
+@_needs_gdscript
+def test_literal_resource_and_global_class_references_are_extracted(tmp_path: Path):
+    (tmp_path / "project.godot").write_text('[application]\nconfig/name="Fixture"\n', encoding="utf-8")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    path = scripts / "smoke.gd"
+    path.write_text(
+        "extends BaseController\n"
+        'const TARGET = preload("res://scripts/target.gd")\n'
+        'const DATA = load("res://data/profile.tres")\n'
+        'const SCENE = ResourceLoader.load("res://scenes/widget.tscn")\n'
+        'const TEXT_ONLY = "preload(\\\"res://missing.gd\\\")"\n'
+        "func run() -> void:\n"
+        "    var target: TargetController = TargetController.new()\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    result = extract_gdscript(path, root=tmp_path)
+    file_node = next(node for node in result["nodes"] if node["label"] == "smoke.gd")
+    facts = file_node["metadata"]["godot_script"]
+
+    assert facts["resource_references"] == [
+        {"kind": "preload", "path": "res://scripts/target.gd", "line": 2, "binding": "TARGET"},
+        {"kind": "load", "path": "res://data/profile.tres", "line": 3, "binding": "DATA"},
+        {"kind": "load", "path": "res://scenes/widget.tscn", "line": 4, "binding": "SCENE"},
+    ]
+    class_refs = {(item["name"], item["kind"]) for item in facts["class_references"]}
+    assert ("BaseController", "extends") in class_refs
+    assert ("TargetController", "type") in class_refs
+    assert ("TargetController", "class_receiver") in class_refs

@@ -329,3 +329,126 @@ def test_unresolved_scene_nodepaths_report_without_phantom_edges(tmp_path: Path)
 
     assert node_path_edges == []
     assert sum("NodePath" in item["message"] for item in diagnostics) == 3
+
+
+@_needs_gdscript
+def test_gdscript_smoke_dependencies_resolve_to_resources_and_global_classes(tmp_path: Path):
+    _write_project(tmp_path)
+    scripts = tmp_path / "scripts"
+    data = tmp_path / "data"
+    scenes = tmp_path / "scenes"
+    tests = tmp_path / "tests"
+    for directory in (scripts, data, scenes, tests):
+        directory.mkdir()
+
+    base = scripts / "base_controller.gd"
+    base.write_text("class_name BaseController\nextends RefCounted\n", encoding="utf-8")
+    target = scripts / "target_controller.gd"
+    target.write_text(
+        "class_name TargetController\nextends BaseController\n"
+        "static func create() -> TargetController:\n"
+        "    return TargetController.new()\n",
+        encoding="utf-8",
+    )
+    resource = data / "profile.tres"
+    resource.write_text('[gd_resource type="Resource" format=3]\n[resource]\n', encoding="utf-8")
+    scene = scenes / "widget.tscn"
+    scene.write_text('[gd_scene format=3]\n[node name="Widget" type="Node2D"]\n', encoding="utf-8")
+    smoke = tests / "target_controller_smoke.gd"
+    smoke.write_text(
+        "extends SceneTree\n"
+        'const TARGET = preload("res://scripts/target_controller.gd")\n'
+        'const PROFILE = preload("res://data/profile.tres")\n'
+        'const WIDGET = load("res://scenes/widget.tscn")\n'
+        'const MISSING = preload("res://scripts/missing_controller.gd")\n'
+        'const TEXT_ONLY = "TargetController and res://scripts/missing_controller.gd"\n'
+        "func run() -> void:\n"
+        "    var target: TargetController = TargetController.new()\n"
+        "    target.create()\n",
+        encoding="utf-8",
+    )
+
+    result = extract([base, target, resource, scene, smoke], root=tmp_path, parallel=False)
+    nodes = {node["id"]: node for node in result["nodes"]}
+    target_class = next(
+        node for node in result["nodes"]
+        if node["label"] == "TargetController"
+        and (node.get("metadata") or {}).get("godot_kind") == "script_class"
+    )
+    smoke_class = next(
+        node for node in result["nodes"]
+        if node["label"] == "target_controller_smoke"
+        and (node.get("metadata") or {}).get("godot_kind") == "script_class"
+    )
+    uses = [edge for edge in result["edges"] if edge.get("source") == smoke_class["id"]]
+    assert any(
+        edge.get("context") == "godot_script_preload" and edge.get("target") == target_class["id"]
+        for edge in uses
+    )
+    assert any(
+        edge.get("context") == "godot_script_preload"
+        and nodes[edge["target"]].get("source_file") == "data/profile.tres"
+        for edge in uses
+    )
+    assert any(
+        edge.get("context") == "godot_script_load"
+        and nodes[edge["target"]].get("label") == "Widget"
+        for edge in uses
+    )
+    assert any(
+        edge.get("context") == "godot_global_class_reference"
+        and edge.get("target") == target_class["id"]
+        for edge in uses
+    )
+    assert not any(
+        edge.get("source") == smoke_class["id"]
+        and "missing_controller.gd" in str((edge.get("metadata") or {}).get("godot_resource_path", ""))
+        for edge in result["edges"]
+    )
+    smoke_file = next(node for node in result["nodes"] if node.get("source_file") == "tests/target_controller_smoke.gd" and node.get("label") == "target_controller_smoke.gd")
+    unresolved = smoke_file["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any("missing_controller.gd" in item["message"] for item in unresolved)
+
+    unchanged_nodes = [node for node in result["nodes"] if node.get("source_file") != smoke_file["source_file"]]
+    unchanged_edges = [edge for edge in result["edges"] if edge.get("source_file") != smoke_file["source_file"]]
+    incremental = extract(
+        [smoke],
+        root=tmp_path,
+        parallel=False,
+        resolution_context_nodes=unchanged_nodes,
+        resolution_context_edges=unchanged_edges,
+    )
+    assert any(
+        edge.get("context") == "godot_script_preload" and edge.get("target") == target_class["id"]
+        for edge in incremental["edges"]
+    )
+
+
+@_needs_gdscript
+def test_duplicate_global_class_names_do_not_create_guessed_edges(tmp_path: Path):
+    _write_project(tmp_path)
+    scripts = tmp_path / "scripts"
+    tests = tmp_path / "tests"
+    scripts.mkdir()
+    tests.mkdir()
+    (scripts / "first.gd").write_text("class_name SharedController\nextends RefCounted\n", encoding="utf-8")
+    (scripts / "second.gd").write_text("class_name SharedController\nextends RefCounted\n", encoding="utf-8")
+    smoke = tests / "duplicate_name_smoke.gd"
+    smoke.write_text(
+        "extends SceneTree\n"
+        "func run() -> void:\n"
+        "    var controller: SharedController\n",
+        encoding="utf-8",
+    )
+
+    result = extract([scripts / "first.gd", scripts / "second.gd", smoke], root=tmp_path, parallel=False)
+    assert not any(
+        edge.get("context") == "godot_global_class_reference"
+        for edge in result["edges"]
+    )
+    smoke_node = next(
+        node for node in result["nodes"]
+        if node.get("source_file") == "tests/duplicate_name_smoke.gd" and node.get("label") == "duplicate_name_smoke.gd"
+    )
+    diagnostics = smoke_node["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any("matches multiple scripts" in item["message"] for item in diagnostics)
