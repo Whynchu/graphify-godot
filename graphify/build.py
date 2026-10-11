@@ -255,7 +255,7 @@ _EDGE_LANG_FAMILY: dict[str, str] = {
     ".py": "py", ".pyi": "py",
     ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "js",
     ".ts": "js", ".tsx": "js", ".mts": "js", ".cts": "js",
-    ".go": "go", ".rs": "rs",
+    ".go": "go", ".gd": "gdscript", ".rs": "rs",
     ".java": "jvm", ".kt": "jvm", ".scala": "jvm", ".groovy": "jvm",
     ".c": "c", ".h": "c", ".cc": "c", ".cpp": "c", ".hpp": "c",
     ".cxx": "c", ".hh": "c", ".hxx": "c",

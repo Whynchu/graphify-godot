@@ -51,6 +51,7 @@ from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.erlang import extract_erlang, resolve_erlang_remote_calls  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
+from graphify.extractors.gdscript import extract_gdscript  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
@@ -3417,6 +3418,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     # Single-language families
     ".py": "python",
     ".go": "go",
+    ".gd": "gdscript",
     ".rs": "rust",
     ".cbl": "cobol", ".cob": "cobol", ".cobol": "cobol", ".cpy": "cobol",
     ".r": "r",
@@ -7315,6 +7317,7 @@ def extract_xaml(path: Path) -> dict:
 
 
 _DISPATCH: dict[str, Any] = {
+    ".gd": extract_gdscript,
     ".py": extract_python,
     ".js": extract_js,
     ".jsx": extract_js,
@@ -7436,6 +7439,7 @@ _DISPATCH: dict[str, Any] = {
 # rather than falling back like Pascal does. Used by the #1745 warning in
 # extract() to tell the user which extra restores the language.
 _EXTRA_FOR_EXTENSION = {
+    ".gd": "godot",
     ".vb": "vbnet",
     ".r": "r",
     ".sol": "solidity",
