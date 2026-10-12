@@ -387,6 +387,126 @@ def test_known_receiver_without_project_method_reports_unresolved_target(tmp_pat
 
 
 @_needs_gdscript
+def test_nested_class_types_nested_collections_and_static_factory_returns_resolve(tmp_path: Path):
+    owner = tmp_path / "outer_model.gd"
+    owner.write_text(
+        "class_name OuterModel\n"
+        "class Inner:\n"
+        "    func ping() -> void:\n"
+        "        pass\n"
+        "class Factory:\n"
+        "    static func create_inner() -> OuterModel.Inner:\n"
+        "        return OuterModel.Inner.new()\n",
+        encoding="utf-8",
+    )
+    caller = tmp_path / "nested_type_caller.gd"
+    caller.write_text(
+        "func direct(target: OuterModel.Inner) -> void:\n"
+        "    target.ping()\n"
+        "func nested_grid(grid: Array[Array[OuterModel.Inner]]) -> void:\n"
+        "    grid[0][0].ping()\n"
+        "func from_factory() -> void:\n"
+        "    var target := OuterModel.Factory.create_inner()\n"
+        "    target.ping()\n",
+        encoding="utf-8",
+    )
+
+    from graphify.extract import extract
+    result = extract([owner, caller], root=tmp_path, parallel=False)
+    nodes = {node["id"]: node for node in result["nodes"]}
+    labels = {node_id: node["label"].strip().lstrip(".").removesuffix("()") for node_id, node in nodes.items()}
+    methods = {
+        edge["target"]: edge["source"]
+        for edge in result["edges"] if edge.get("relation") == "method"
+    }
+    inner = next(
+        node for node in result["nodes"]
+        if node.get("metadata", {}).get("godot_qualified_class_name") == "OuterModel.Inner"
+    )
+    ping = next(method_id for method_id, owner_id in methods.items() if owner_id == inner["id"] and labels[method_id] == "ping")
+    factory_create = next(
+        node for node in result["nodes"]
+        if str(node.get("label") or "").strip().lstrip(".").removesuffix("()") == "create_inner"
+        and node.get("metadata", {}).get("godot_static") is True
+    )
+    calls = [edge for edge in result["edges"] if edge.get("relation") == "calls"]
+    call_targets = {
+        (labels[edge["source"]], edge.get("source_location"), edge["target"])
+        for edge in calls
+    }
+    assert any(caller_name == "direct" and target_id == ping for caller_name, _line, target_id in call_targets)
+    assert any(caller_name == "nested_grid" and target_id == ping for caller_name, _line, target_id in call_targets)
+    assert any(caller_name == "nested_grid" and _line == "L4" and target_id == ping for caller_name, _line, target_id in call_targets)
+    assert any(caller_name == "from_factory" and target_id == factory_create["id"] for caller_name, _line, target_id in call_targets)
+    assert any(caller_name == "from_factory" and target_id == ping for caller_name, _line, target_id in call_targets)
+
+
+@_needs_gdscript
+def test_literal_property_get_set_and_inline_accessor_bodies_resolve(tmp_path: Path):
+    path = tmp_path / "accessor_demo.gd"
+    path.write_text(
+        "class_name AccessorDemo\n"
+        "var _health: int = 0\n"
+        "var health: int:\n"
+        "    get:\n"
+        "        return _health\n"
+        "    set(value):\n"
+        "        _health = value\n"
+        "func use_property(name: String) -> void:\n"
+        '    get("health")\n'
+        '    set("health", 5)\n'
+        "    get(name)\n",
+        encoding="utf-8",
+    )
+
+    from graphify.extract import extract
+    result = extract([path], root=tmp_path, parallel=False, cache_root=tmp_path / "cache")
+    nodes = {node["id"]: node for node in result["nodes"]}
+    property_node = next(
+        node for node in result["nodes"]
+        if node.get("label") == "health"
+        and node.get("metadata", {}).get("godot_kind") == "script_property"
+    )
+    backing_property = next(
+        node for node in result["nodes"]
+        if node.get("label") == "_health"
+        and node.get("metadata", {}).get("godot_kind") == "script_property"
+    )
+    accessors = {
+        node["metadata"]["godot_accessor"]: node
+        for node in result["nodes"]
+        if node.get("metadata", {}).get("godot_kind") == "script_accessor"
+    }
+    assert set(accessors) == {"getter", "setter"}
+    uses = next(node for node in result["nodes"] if node.get("label") == "use_property()")
+    contexts = {
+        edge.get("context")
+        for edge in result["edges"]
+        if edge.get("source") == uses["id"] and edge.get("target") in {property_node["id"], *[n["id"] for n in accessors.values()]}
+    }
+    assert "godot_script_property_read" in contexts
+    assert "godot_script_property_write" in contexts
+    assert "godot_script_property_getter" in contexts
+    assert "godot_script_property_setter" in contexts
+    assert any(
+        edge.get("source") == accessors["getter"]["id"]
+        and edge.get("target") == backing_property["id"]
+        and edge.get("context") == "godot_script_property_read"
+        for edge in result["edges"]
+    )
+    assert any(
+        edge.get("source") == accessors["setter"]["id"]
+        and edge.get("target") == backing_property["id"]
+        and edge.get("context") == "godot_script_property_write"
+        for edge in result["edges"]
+    )
+    file_node = next(node for node in result["nodes"] if node.get("label") == "accessor_demo.gd")
+    diagnostics = file_node["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any(item.get("kind") == "godot_dynamic_property_access" for item in diagnostics)
+    assert not any(item.get("kind") == "godot_receiver_method_not_found" for item in diagnostics)
+
+
+@_needs_gdscript
 def test_typed_cross_script_property_reads_and_writes_resolve_to_definitions(tmp_path: Path):
     definition = tmp_path / "enemy_definition.gd"
     definition.write_text(
@@ -472,6 +592,142 @@ def test_script_signal_emits_and_literal_callbacks_resolve(tmp_path: Path):
     assert ("run", "changed", "godot_script_signal_emit") in rows
     assert ("run", "changed", "godot_script_signal_connection") in rows
     assert ("changed", "_on_changed", "godot_script_signal_callback") in rows
+
+
+@_needs_gdscript
+def test_lambda_calls_and_signal_callbacks_have_lambda_owners(tmp_path: Path):
+    path = tmp_path / "lambda_ownership.gd"
+    path.write_text(
+        "class_name LambdaOwnership\n"
+        "signal fired\n"
+        "func target() -> void: pass\n"
+        "func run() -> void:\n"
+        "    var deferred = func() -> void: target()\n"
+        "    target()\n"
+        "    fired.connect(func() -> void: target())\n",
+        encoding="utf-8",
+    )
+
+    from graphify.extract import extract
+    result = extract([path], cache_root=tmp_path / "graphify-cache", root=tmp_path, parallel=False)
+    nodes = {node["id"]: node for node in result["nodes"]}
+    lambdas = [
+        node for node in result["nodes"]
+        if (node.get("metadata") or {}).get("godot_kind") == "script_lambda"
+    ]
+    run = next(node for node in result["nodes"] if node.get("label") == "run()")
+    target = next(node for node in result["nodes"] if node.get("label") == "target()")
+    signal = next(
+        node for node in result["nodes"]
+        if (node.get("metadata") or {}).get("godot_kind") == "script_signal"
+    )
+    assert len(lambdas) == 2
+    call_edges = [edge for edge in result["edges"] if edge.get("relation") == "calls" and edge.get("target") == target["id"]]
+    assert {edge["source"] for edge in call_edges} == {run["id"], *[node["id"] for node in lambdas]}
+    callback_edges = [
+        edge for edge in result["edges"]
+        if edge.get("source") == signal["id"] and edge.get("context") == "godot_script_signal_callback"
+    ]
+    assert {edge["target"] for edge in callback_edges} == {lambdas[-1]["id"]}
+    assert all(nodes[edge["source"]].get("metadata", {}).get("godot_kind") == "script_lambda" for edge in call_edges if edge["source"] != run["id"])
+
+
+@_needs_gdscript
+def test_signal_callbacks_resolve_only_from_typed_callable_receivers(tmp_path: Path):
+    listener = tmp_path / "listener.gd"
+    listener.write_text(
+        "class_name CallbackListener\n"
+        "func handle() -> void: pass\n",
+        encoding="utf-8",
+    )
+    owner = tmp_path / "callback_owner.gd"
+    owner.write_text(
+        "class_name CallbackOwner\n"
+        "signal fired\n"
+        "func handle() -> void: pass\n"
+        "func connect_typed(listener: CallbackListener) -> void:\n"
+        "    fired.connect(Callable(listener, \"handle\"))\n"
+        "func connect_unknown(listener) -> void:\n"
+        "    fired.connect(Callable(listener, \"handle\"))\n",
+        encoding="utf-8",
+    )
+
+    from graphify.extract import extract
+    result = extract([listener, owner], cache_root=tmp_path / "graphify-cache", root=tmp_path, parallel=False)
+    labels = {node["id"]: node["label"].strip().lstrip(".").removesuffix("()") for node in result["nodes"]}
+    listener_method = next(
+        node for node in result["nodes"]
+        if node.get("label") == "handle()" and node.get("source_file", "").endswith("listener.gd")
+    )
+    owner_method = next(
+        node for node in result["nodes"]
+        if node.get("label") == "handle()" and node.get("source_file", "").endswith("callback_owner.gd")
+    )
+    signal = next(node for node in result["nodes"] if (node.get("metadata") or {}).get("godot_kind") == "script_signal")
+    callback_edges = [
+        edge for edge in result["edges"]
+        if edge.get("source") == signal["id"] and edge.get("context") == "godot_script_signal_callback"
+    ]
+    assert [edge["target"] for edge in callback_edges] == [listener_method["id"]]
+    assert owner_method["id"] not in {edge["target"] for edge in callback_edges}
+    file_node = next(node for node in result["nodes"] if node.get("label") == "callback_owner.gd")
+    diagnostics = file_node["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any(item.get("kind") == "godot_dynamic_signal_callback" for item in diagnostics)
+    assert labels[callback_edges[0]["target"]] == "handle"
+
+
+@_needs_gdscript
+def test_literal_loaded_resource_uses_attached_script_for_calls_and_properties(tmp_path: Path):
+    resource_script = tmp_path / "combat_config.gd"
+    resource_script.write_text(
+        "class_name CombatConfig\n"
+        "extends Resource\n"
+        "@export var damage: int = 3\n"
+        "func apply() -> void: pass\n",
+        encoding="utf-8",
+    )
+    resource = tmp_path / "combat_config.tres"
+    resource.write_text(
+        '[gd_resource type="Resource" script_class="CombatConfig" load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://combat_config.gd" id="script"]\n'
+        '[resource]\n'
+        'script = ExtResource("script")\n'
+        'damage = 7\n',
+        encoding="utf-8",
+    )
+    consumer = tmp_path / "combat_consumer.gd"
+    consumer.write_text(
+        "class_name CombatConsumer\n"
+        "func run() -> void:\n"
+        '    var config = load("res://combat_config.tres")\n'
+        "    config.apply()\n"
+        "    print(config.damage)\n",
+        encoding="utf-8",
+    )
+
+    from graphify.extract import extract
+    result = extract(
+        [resource_script, resource, consumer],
+        cache_root=tmp_path / "graphify-cache",
+        root=tmp_path,
+        parallel=False,
+    )
+    labels = {node["id"]: node["label"].strip().lstrip(".").removesuffix("()") for node in result["nodes"]}
+    run = next(node for node in result["nodes"] if node.get("label") == "run()")
+    apply_method = next(node for node in result["nodes"] if node.get("label") == "apply()")
+    damage = next(
+        node for node in result["nodes"]
+        if node.get("label") == "damage" and (node.get("metadata") or {}).get("godot_kind") == "script_property"
+    )
+    assert any(
+        edge.get("source") == run["id"] and edge.get("target") == apply_method["id"]
+        and edge.get("relation") == "calls" for edge in result["edges"]
+    )
+    assert any(
+        edge.get("source") == run["id"] and edge.get("target") == damage["id"]
+        and edge.get("context") == "godot_script_property_read" for edge in result["edges"]
+    )
+    assert labels[apply_method["id"]] == "apply"
 
 
 @_needs_gdscript

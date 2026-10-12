@@ -37,8 +37,9 @@ except Exception:
     _EXTRACTOR_VERSION = "unknown"
 
 # Bump when AST cache-key semantics change independently of the package version.
-# Schema 12 adds static GDScript references and portable test-inventory facts.
-_AST_CACHE_SCHEMA = 14
+# Schema 19 adds nested Godot type facts, collision-safe members, accessor/lambda
+# ownership and literal loaded-resource bindings.
+_AST_CACHE_SCHEMA = 19
 
 
 # Per-process memo: distributions() scans site-packages metadata, which is

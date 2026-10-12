@@ -34,6 +34,44 @@ def _node_text(node, source: bytes) -> str:
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
 
 
+def _call_expression_fact(node, source: bytes) -> dict | None:
+    """Return a small syntax-backed receiver/method record for a call value."""
+    if node is None:
+        return None
+    if node.type == "call":
+        parts = node.named_children
+        if parts and parts[0].type == "identifier":
+            return {
+                "receiver": "",
+                "receiver_kind": "unqualified",
+                "callee": _node_text(parts[0], source)[:160],
+            }
+    if node.type == "attribute":
+        parts = node.named_children
+        if len(parts) < 2 or parts[-1].type != "attribute_call":
+            return None
+        call_parts = parts[-1].named_children
+        if not call_parts or call_parts[0].type != "identifier":
+            return None
+        receiver = ".".join(_node_text(part, source) for part in parts[:-1])
+        if receiver == "self":
+            receiver_kind = "self"
+        elif receiver == "super":
+            receiver_kind = "super"
+        elif receiver[:1].isupper() and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", receiver):
+            receiver_kind = "class"
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", receiver):
+            receiver_kind = "identifier"
+        else:
+            receiver_kind = "dynamic"
+        return {
+            "receiver": receiver[:160],
+            "receiver_kind": receiver_kind,
+            "callee": _node_text(call_parts[0], source)[:160],
+        }
+    return None
+
+
 def _normalize_inline_compound_statements(source: bytes) -> tuple[bytes, list[int], int]:
     """Put supported one-line compound suites on indented parser lines.
 
@@ -313,6 +351,19 @@ def _script_reference_facts(root, source: bytes) -> tuple[list[dict], list[dict]
             parent = parent.parent
         return "", 1
 
+    def resource_binding(node) -> tuple[str, int]:
+        parent = node.parent
+        if parent is not None and parent.type == "variable_statement":
+            value_node = parent.child_by_field_name("value")
+            if value_node is not None and value_node.start_byte <= node.start_byte < value_node.end_byte:
+                binding = _node_text(parent.child_by_field_name("name"), source)[:160]
+                owner = parent.parent
+                while owner is not None and owner.type not in {"class_definition", "module"}:
+                    owner = owner.parent
+                owner_line = owner.start_point[0] + 1 if owner is not None and owner.type == "class_definition" else root_class_line
+                return binding, owner_line
+        return const_binding(node)
+
     def add_resource(kind: str, call_node, argument_node) -> None:
         if argument_node is None or argument_node.type != "string":
             return
@@ -327,7 +378,7 @@ def _script_reference_facts(root, source: bytes) -> tuple[list[dict], list[dict]
         if path.startswith("res://") and suffix not in _GODOT_SOURCE_SUFFIXES:
             return
         line = call_node.start_point[0] + 1
-        binding, owner_class_line = const_binding(call_node)
+        binding, owner_class_line = resource_binding(call_node)
         key = (kind, path, line, binding)
         if key in resource_seen or len(resources) >= _MAX_SCRIPT_RESOURCE_REFS:
             return
@@ -480,6 +531,7 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
     class_metadata = {
         "godot_kind": "script_class",
         "godot_global_class": bool(class_name),
+        "godot_qualified_class_name": (class_name or stem)[:240],
         "godot_project_id": project_context["project_id"],
         "godot_res_path": project_context["res_path"],
     }
@@ -580,6 +632,7 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
     node_references: list[dict] = []
     dynamic_references: list[dict] = list(dynamic_resource_refs)
     declarations: set[tuple[str, str, str]] = set()
+    member_ids: set[str] = {str(node.get("id") or "") for node in result.get("nodes", [])}
 
     def add_member(owner_id: str, name: str, kind: str, declaration, extra: dict | None = None) -> dict | None:
         if not name or (owner_id, kind, name) in declarations:
@@ -587,6 +640,18 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
         declarations.add((owner_id, kind, name))
         line = declaration.start_point[0] + 1
         node_id = _make_id(owner_id, kind, name)
+        if node_id in member_ids:
+            # make_id() trims identifier-edge underscores for readability, so
+            # valid GDScript names such as ``health`` and ``_health`` can
+            # otherwise collapse to the same graph ID. Keep the common ID
+            # unchanged and add an encoded source name only for collisions.
+            raw_name = name.encode("utf-8").hex()
+            node_id = f"{node_id}_symbol_{raw_name}"
+            suffix = 2
+            while node_id in member_ids:
+                node_id = f"{_make_id(owner_id, kind, name)}_symbol_{raw_name}_{suffix}"
+                suffix += 1
+        member_ids.add(node_id)
         metadata = {"godot_kind": kind}
         metadata.update({
             "godot_project_id": project_context["project_id"],
@@ -619,7 +684,7 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
         stack = [function_node]
         while stack:
             current = stack.pop()
-            if current is not function_node and current.type in {"function_definition", "class_definition"}:
+            if current is not function_node and current.type in {"function_definition", "class_definition", "lambda"}:
                 continue
             if current.type == "variable_statement":
                 value = _node_text(current.child_by_field_name("name"), source)
@@ -635,7 +700,7 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
             stack.extend(current.named_children)
         return names
 
-    def visit_class(class_ast, owner_id: str, owner_line: int) -> None:
+    def visit_class(class_ast, owner_id: str, owner_line: int, owner_qualified_name: str) -> None:
         declarations_in_class = class_ast.named_children
         property_names = {
             _node_text(child.child_by_field_name("name"), source)
@@ -659,6 +724,7 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                 class_metadata = dict(class_node.get("metadata") or {})
                 class_metadata.update({
                     "godot_kind": "script_inner_class",
+                    "godot_qualified_class_name": f"{owner_qualified_name}.{class_name}"[:240],
                     "godot_owner_class_line": owner_line,
                     "godot_project_id": project_context["project_id"],
                     "godot_res_path": project_context["res_path"],
@@ -667,7 +733,12 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                 for edge in result["edges"]:
                     if edge.get("target") == class_node["id"] and edge.get("relation") == "contains" and edge.get("source") == file_node["id"]:
                         edge["source"] = owner_id
-                visit_class(declaration.child_by_field_name("body"), class_node["id"], declaration.start_point[0] + 1)
+                visit_class(
+                    declaration.child_by_field_name("body"),
+                    class_node["id"],
+                    declaration.start_point[0] + 1,
+                    f"{owner_qualified_name}.{class_name}",
+                )
             elif declaration.type == "function_definition":
                 name = _node_text(declaration.child_by_field_name("name"), source)
                 method = methods_by_location.get((f"L{declaration.start_point[0] + 1}", name))
@@ -698,7 +769,8 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                             param_name = _node_text(param_name_node, source)
                             if param_name:
                                 receiver_bindings.append({
-                                    "owner_class_line": owner_line, "caller_line": declaration.start_point[0] + 1,
+                                    "owner_class_line": owner_line,
+                                    "caller_line": declaration.start_point[0] + 1,
                                     "name": param_name[:160], "type": param_type[:200],
                                     "line": parameter.start_point[0] + 1, "inferred": False,
                                     "declared": bool(param_type), "unknown": not bool(param_type),
@@ -706,15 +778,100 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
 
                     local_names = local_names_for(declaration)
                     body = declaration.child_by_field_name("body")
-                    stack = [body] if body is not None else []
+                    stack = [(body, None)] if body is not None else []
                     while stack:
-                        call_node = stack.pop()
+                        call_node, lambda_scope = stack.pop()
                         if call_node is not body and call_node.type in {"function_definition", "class_definition"}:
                             continue
+                        if call_node.type == "lambda":
+                            lambda_line = call_node.start_point[0] + 1
+                            lambda_column = call_node.start_point[1] + 1
+                            lambda_label = f"lambda@L{lambda_line}:{lambda_column}"
+                            lambda_id = _make_id(
+                                owner_id,
+                                "script_lambda",
+                                f"L{declaration.start_point[0] + 1}",
+                                f"L{lambda_line}",
+                                f"C{lambda_column}",
+                            )
+                            lambda_node = {
+                                "id": lambda_id,
+                                "label": lambda_label[:180],
+                                "file_type": "code",
+                                "source_file": file_node["source_file"],
+                                "source_location": f"L{lambda_line}",
+                                "metadata": {
+                                    "godot_kind": "script_lambda",
+                                    "godot_owner_class_line": owner_line,
+                                    "godot_enclosing_method_line": declaration.start_point[0] + 1,
+                                    "godot_enclosing_method_name": name[:160],
+                                    "godot_lambda_column": lambda_column,
+                                    "godot_project_id": project_context["project_id"],
+                                    "godot_res_path": project_context["res_path"],
+                                },
+                            }
+                            result["nodes"].append(lambda_node)
+                            member_ids.add(lambda_id)
+                            parent_lambda = lambda_scope["node"] if lambda_scope else method
+                            if parent_lambda is not None:
+                                result["edges"].append({
+                                    "source": parent_lambda["id"],
+                                    "target": lambda_id,
+                                    "relation": "contains",
+                                    "context": "godot_lambda",
+                                    "confidence": "EXTRACTED",
+                                    "source_file": file_node["source_file"],
+                                    "source_location": f"L{lambda_line}",
+                                    "weight": 1.0,
+                                })
+                            lambda_scope = {
+                                "line": lambda_line,
+                                "column": lambda_column,
+                                "name": lambda_label,
+                                "node": lambda_node,
+                                "local_names": local_names_for(call_node),
+                            }
+                            lambda_parameters = call_node.child_by_field_name("parameters")
+                            if lambda_parameters is not None:
+                                for parameter in lambda_parameters.named_children:
+                                    param_name_node = parameter.child_by_field_name("name")
+                                    if param_name_node is None:
+                                        param_name_node = next((child for child in parameter.named_children if child.type in {"identifier", "name"}), None)
+                                    param_name = _node_text(param_name_node, source)
+                                    if param_name:
+                                        param_type = _node_text(parameter.child_by_field_name("type"), source)
+                                        receiver_bindings.append({
+                                            "owner_class_line": owner_line,
+                                            "caller_line": lambda_line,
+                                            "caller_kind": "lambda",
+                                            "caller_column": lambda_column,
+                                            "name": param_name[:160],
+                                            "type": param_type[:200],
+                                            "line": parameter.start_point[0] + 1,
+                                            "inferred": False,
+                                            "declared": bool(param_type),
+                                            "unknown": not bool(param_type),
+                                        })
+                            lambda_body = call_node.child_by_field_name("body")
+                            if lambda_body is not None:
+                                stack.append((lambda_body, lambda_scope))
+                            continue
+                        caller_line = lambda_scope["line"] if lambda_scope else declaration.start_point[0] + 1
+                        caller_name = lambda_scope["name"] if lambda_scope else name
+                        caller_scope_fields = (
+                            {
+                                "caller_kind": "lambda",
+                                "caller_column": lambda_scope["column"],
+                                "caller_method_line": declaration.start_point[0] + 1,
+                            }
+                            if lambda_scope else {}
+                        )
+                        active_local_names = lambda_scope["local_names"] if lambda_scope else local_names
                         callee = ""
                         receiver = ""
                         receiver_kind = "unqualified"
                         receiver_indexed = False
+                        receiver_indexed_depth = 0
                         call_line = call_node.start_point[0] + 1
                         path_fact = _node_path_reference(call_node, source)
                         if path_fact is not None and len(node_references) < 50_000:
@@ -733,8 +890,9 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                         member_call = _node_text(call_parts[0], source)
                             node_references.append({
                                 **path_fact,
-                                "caller_line": declaration.start_point[0] + 1,
-                                "caller_name": name[:160],
+                                "caller_line": caller_line,
+                                "caller_name": caller_name[:160],
+                                **caller_scope_fields,
                                 "owner_class_line": owner_line,
                                 "binding": binding_name[:160],
                                 "callee": member_call[:160],
@@ -750,24 +908,33 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                             call_parts = call_node.named_children
                             if named and call_parts and call_parts[0].type == "identifier":
                                 receiver_node = named[0]
-                                receiver_indexed = receiver_node.type == "subscript"
-                                if receiver_indexed and receiver_node.named_children:
-                                    receiver_node = receiver_node.named_children[0]
-                                receiver = _node_text(receiver_node, source)
+                                receiver_indexed_depth = 0
+                                if len(named) > 2:
+                                    receiver = ".".join(_node_text(part, source) for part in named[:-1])
+                                else:
+                                    while receiver_node.type == "subscript" and receiver_node.named_children:
+                                        receiver_indexed_depth += 1
+                                        receiver_node = receiver_node.named_children[0]
+                                    receiver = _node_text(receiver_node, source)
+                                receiver_indexed = receiver_indexed_depth > 0
                                 callee = _node_text(call_parts[0], source)
-                                receiver_kind = "self" if receiver == "self" else "super" if receiver == "super" else "class" if receiver[:1].isupper() else "identifier" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", receiver) else "dynamic"
+                                receiver_kind = "self" if receiver == "self" else "super" if receiver == "super" else "class" if receiver[:1].isupper() and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", receiver) else "identifier" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", receiver) else "dynamic"
                                 signal_receiver = receiver
                                 if receiver == "self" and len(named) > 2:
                                     signal_receiver = f"self.{_node_text(named[1], source)}"
                                 signal_name = signal_receiver if signal_receiver in signal_names else signal_receiver.rsplit(".", 1)[-1] if signal_receiver.startswith("self.") else ""
                                 may_be_inherited_signal = (
                                     callee in {"emit", "connect"}
-                                    and receiver == "self"
+                                    and (receiver == "self" or receiver.startswith("self."))
                                     and signal_name not in property_names
                                 )
                                 if (signal_name in signal_names or may_be_inherited_signal) and callee in {"emit", "connect"}:
                                     callback_name = ""
                                     callback_dynamic = False
+                                    callback_receiver = ""
+                                    callback_receiver_kind = "unqualified"
+                                    callback_lambda_line = 0
+                                    callback_lambda_column = 0
                                     if callee == "connect" and len(call_parts) > 1:
                                         arguments = call_parts[1]
                                         callback = arguments.named_children[0] if arguments.named_children else None
@@ -775,26 +942,38 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                             callback_name = _node_text(callback, source)
                                         elif callback is not None and callback.type == "attribute":
                                             callback_children = callback.named_children
-                                            if len(callback_children) > 1 and _node_text(callback_children[0], source) == "self":
+                                            if len(callback_children) > 1:
                                                 callback_name = _node_text(callback_children[-1], source)
+                                                callback_receiver = _node_text(callback_children[0], source)
+                                                callback_receiver_kind = "self" if callback_receiver == "self" else "identifier" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", callback_receiver) else "dynamic"
                                         elif callback is not None and callback.type == "call" and callback.named_children and _node_text(callback.named_children[0], source) == "Callable":
-                                            strings = []
-                                            callback_stack = [callback]
-                                            while callback_stack:
-                                                part = callback_stack.pop()
-                                                if part.type == "string":
-                                                    strings.append(_decode_string(_node_text(part, source)))
-                                                callback_stack.extend(part.named_children)
-                                            if strings:
-                                                callback_name = strings[-1]
-                                        callback_dynamic = callback is not None and not callback_name
+                                            callable_arguments = next((part for part in callback.named_children[1:] if part.type == "arguments"), None)
+                                            callable_parts = callable_arguments.named_children if callable_arguments is not None else []
+                                            if len(callable_parts) >= 2 and callable_parts[1].type == "string":
+                                                callback_name = _decode_string(_node_text(callable_parts[1], source))
+                                                callback_receiver = _node_text(callable_parts[0], source)
+                                                callback_receiver_kind = (
+                                                    "self" if callback_receiver == "self"
+                                                    else "identifier" if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", callback_receiver)
+                                                    else "class" if callback_receiver[:1].isupper()
+                                                    else "dynamic"
+                                                )
+                                        elif callback is not None and callback.type == "lambda":
+                                            callback_lambda_line = callback.start_point[0] + 1
+                                            callback_lambda_column = callback.start_point[1] + 1
+                                        callback_dynamic = callback is not None and not callback_name and not callback_lambda_line
                                     signal_references.append({
-                                        "caller_line": declaration.start_point[0] + 1,
-                                        "caller_name": name[:160],
+                                        "caller_line": caller_line,
+                                        "caller_name": caller_name[:160],
+                                        **caller_scope_fields,
                                         "owner_class_line": owner_line,
                                         "signal": signal_name[:160],
                                         "event": "emit" if callee == "emit" else "connect",
                                         "callback": callback_name[:160],
+                                        "callback_receiver": callback_receiver[:160],
+                                        "callback_receiver_kind": callback_receiver_kind,
+                                        "callback_lambda_line": callback_lambda_line,
+                                        "callback_lambda_column": callback_lambda_column,
                                         "callback_dynamic": callback_dynamic,
                                         "line": call_line,
                                     })
@@ -813,14 +992,43 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                 "literal_method": first_string[:160] if callee in {"call", "call_deferred"} else "",
                                 "literal_group": first_string[:160] if callee in {"get_nodes_in_group", "call_group", "call_group_flags"} else "",
                                 "owner_class_line": owner_line,
-                                "caller_line": declaration.start_point[0] + 1,
-                                "caller_name": name[:160],
+                                "caller_line": caller_line,
+                                "caller_name": caller_name[:160],
+                                **caller_scope_fields,
+                                "line": call_line,
+                            })
+                        literal_property_access = callee in {"get", "set"} and bool(first_string)
+                        if callee in {"get", "set"} and not first_string and len(dynamic_references) < 50_000:
+                            dynamic_references.append({
+                                "kind": "dynamic_property_access",
+                                "operation": callee,
+                                "receiver": receiver[:160],
+                                "receiver_kind": receiver_kind,
+                                "owner_class_line": owner_line,
+                                "caller_line": caller_line,
+                                "caller_name": caller_name[:160],
+                                **caller_scope_fields,
+                                "access": "read" if callee == "get" else "write",
+                                "line": call_line,
+                            })
+                        elif literal_property_access:
+                            property_references.append({
+                                "caller_line": caller_line,
+                                "caller_name": caller_name[:160],
+                                **caller_scope_fields,
+                                "owner_class_line": owner_line,
+                                "property": first_string[:160],
+                                "receiver": receiver[:160],
+                                "receiver_kind": receiver_kind,
+                                "access": "read" if callee == "get" else "write",
+                                "dynamic_literal": True,
                                 "line": call_line,
                             })
                         if callee in {"call", "call_deferred"} and first_string:
                             call_references.append({
-                                "caller_line": declaration.start_point[0] + 1,
-                                "caller_name": name[:160],
+                                "caller_line": caller_line,
+                                "caller_name": caller_name[:160],
+                                **caller_scope_fields,
                                 "owner_class_line": owner_line,
                                 "callee": first_string[:160],
                                 "receiver": receiver[:160],
@@ -830,16 +1038,18 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                 "dispatch_operation": callee,
                                 "line": call_line,
                             })
-                        if callee and callee != "new" and callee not in {"call", "call_deferred", "callv", "call_group", "call_group_flags", "get_nodes_in_group", "set_script", "add_child"}:
+                        if callee and callee != "new" and callee not in {"call", "call_deferred", "callv", "call_group", "call_group_flags", "get_nodes_in_group", "set_script", "add_child", "get", "set"}:
                             call_references.append({
-                                "caller_line": declaration.start_point[0] + 1,
-                                "caller_name": name[:160],
+                                "caller_line": caller_line,
+                                "caller_name": caller_name[:160],
+                                **caller_scope_fields,
                                 "owner_class_line": owner_line,
                                 "callee": callee[:160],
                                 "receiver": receiver[:160],
                                 "receiver_kind": receiver_kind,
                                 "receiver_indexed": receiver_indexed,
-                                "shadowed": receiver_kind == "unqualified" and callee in local_names,
+                                "receiver_indexed_depth": receiver_indexed_depth,
+                                "shadowed": receiver_kind == "unqualified" and callee in active_local_names,
                                 "line": call_line,
                             })
                         if call_node.type == "variable_statement":
@@ -852,12 +1062,19 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                 if len(value_parts) >= 2 and _node_text(value_parts[0], source)[:1].isupper() and _node_text(value_parts[1], source).startswith("new"):
                                     inferred_type = _node_text(value_parts[0], source)
                             if var_name:
+                                inferred_return_call = (
+                                    _call_expression_fact(value_node, source)
+                                    if not inferred_type and not (var_type and var_type != ":=")
+                                    else None
+                                )
                                 receiver_bindings.append({
-                                    "owner_class_line": owner_line, "caller_line": declaration.start_point[0] + 1,
+                                    "owner_class_line": owner_line, "caller_line": caller_line,
+                                    **caller_scope_fields,
                                     "name": var_name[:160], "type": (inferred_type or (var_type if var_type != ":=" else ""))[:200],
                                     "line": call_line, "inferred": bool(inferred_type),
                                     "declared": bool(var_type and var_type != ":="),
                                     "unknown": not bool(inferred_type or (var_type and var_type != ":=")),
+                                    **({"inferred_return_call": inferred_return_call} if inferred_return_call else {}),
                                 })
                         if call_node.type == "identifier":
                             property_name = _node_text(call_node, source)
@@ -866,7 +1083,7 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                             if parent is not None and parent.type == "attribute" and len(parent.named_children) > 1 and parent.named_children[1].id == call_node.id:
                                 is_explicit_self_property = _node_text(parent.named_children[0], source) == "self"
                             is_attribute_receiver = parent is not None and parent.type == "attribute" and parent.named_children and parent.named_children[0].id == call_node.id
-                            if property_name in property_names and property_name not in local_names and (not is_attribute_receiver or is_explicit_self_property):
+                            if property_name in property_names and property_name not in active_local_names and (not is_attribute_receiver or is_explicit_self_property):
                                 access = "read"
                                 ancestor = parent
                                 while ancestor is not None and ancestor.type not in {"assignment", "augmented_assignment", "function_definition", "class_definition"}:
@@ -876,8 +1093,9 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                     if left is not None and left.start_byte <= call_node.start_byte < left.end_byte:
                                         access = "read_write" if ancestor.type == "augmented_assignment" else "write"
                                 property_references.append({
-                                    "caller_line": declaration.start_point[0] + 1,
-                                    "caller_name": name[:160],
+                                    "caller_line": caller_line,
+                                    "caller_name": caller_name[:160],
+                                    **caller_scope_fields,
                                     "owner_class_line": owner_line,
                                     "property": property_name[:160],
                                     "access": access,
@@ -887,6 +1105,10 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                             attribute_parts = call_node.named_children
                             if len(attribute_parts) == 2 and attribute_parts[1].type == "identifier":
                                 receiver_node, property_node = attribute_parts
+                                receiver_indexed_depth = 0
+                                while receiver_node.type == "subscript" and receiver_node.named_children:
+                                    receiver_indexed_depth += 1
+                                    receiver_node = receiver_node.named_children[0]
                                 receiver_name = _node_text(receiver_node, source)
                                 property_name = _node_text(property_node, source)
                                 if receiver_name != "self" and property_name:
@@ -905,16 +1127,19 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                         if left is not None and left.start_byte <= call_node.start_byte < left.end_byte:
                                             access = "read_write" if ancestor.type == "augmented_assignment" else "write"
                                     property_references.append({
-                                        "caller_line": declaration.start_point[0] + 1,
-                                        "caller_name": name[:160],
+                                        "caller_line": caller_line,
+                                        "caller_name": caller_name[:160],
+                                        **caller_scope_fields,
                                         "owner_class_line": owner_line,
                                         "property": property_name[:160],
                                         "receiver": receiver_name[:160],
                                         "receiver_kind": receiver_ref_kind,
+                                        "receiver_indexed": receiver_indexed_depth > 0,
+                                        "receiver_indexed_depth": receiver_indexed_depth,
                                         "access": access,
                                         "line": call_line,
                                     })
-                        stack.extend(reversed(call_node.named_children))
+                        stack.extend((child, lambda_scope) for child in reversed(call_node.named_children))
                     # Reassigning an inferred local changes the receiver value.
                     # Preserve a new type only for a straight-line, explicit
                     # Class.new() assignment; branch/loop assignments fail
@@ -923,6 +1148,8 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                     assignments = []
                     while assignment_stack:
                         candidate = assignment_stack.pop()
+                        if candidate.type == "lambda":
+                            continue
                         if candidate is not body and candidate.type in {"function_definition", "class_definition"}:
                             continue
                         if candidate.type in {"assignment", "augmented_assignment"}:
@@ -1000,6 +1227,62 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                 prop = add_member(owner_id, name, "script_property", declaration, property_metadata)
                 if prop:
                     receiver_bindings.append({"owner_class_line": owner_line, "name": name[:160], "type": type_text, "line": declaration.start_point[0] + 1, "inferred": False, "declared": bool(type_text), "unknown": not bool(type_text)})
+                    if accessors is not None:
+                        for access_name, child_type in (("getter", "get_body"), ("setter", "set_body")):
+                            accessor = accessors.child_by_field_name("get" if access_name == "getter" else "set")
+                            if accessor is None or accessor.type != child_type:
+                                continue
+                            accessor_id = _make_id(prop["id"], "inline_accessor", access_name)
+                            accessor_node = {
+                                "id": accessor_id,
+                                "label": f"{access_name} {name}"[:180],
+                                "file_type": "code",
+                                "source_file": file_node["source_file"],
+                                "source_location": f"L{accessor.start_point[0] + 1}",
+                                "metadata": {
+                                    "godot_kind": "script_accessor",
+                                    "godot_accessor": access_name,
+                                    "godot_property": name[:160],
+                                    "godot_owner_class_line": owner_line,
+                                    "godot_project_id": project_context["project_id"],
+                                    "godot_res_path": project_context["res_path"],
+                                },
+                            }
+                            result["nodes"].append(accessor_node)
+                            result["edges"].append({
+                                "source": prop["id"],
+                                "target": accessor_id,
+                                "relation": "contains",
+                                "context": "godot_inline_property_accessor",
+                                "confidence": "EXTRACTED",
+                                "source_file": file_node["source_file"],
+                                "source_location": f"L{accessor.start_point[0] + 1}",
+                                "weight": 1.0,
+                            })
+                            accessor_body = accessor.child_by_field_name("body")
+                            accessor_stack = [accessor_body] if accessor_body is not None else []
+                            while accessor_stack:
+                                accessor_child = accessor_stack.pop()
+                                if accessor_child.type == "identifier":
+                                    referenced_name = _node_text(accessor_child, source)
+                                    if referenced_name in property_names and referenced_name != name:
+                                        access = "read"
+                                        parent = accessor_child.parent
+                                        while parent is not None and parent.type not in {"assignment", "augmented_assignment", "get_body", "set_body"}:
+                                            parent = parent.parent
+                                        if parent is not None and parent.type in {"assignment", "augmented_assignment"}:
+                                            left = parent.child_by_field_name("left")
+                                            if left is not None and left.start_byte <= accessor_child.start_byte < left.end_byte:
+                                                access = "read_write" if parent.type == "augmented_assignment" else "write"
+                                        property_references.append({
+                                            "caller_accessor": access_name,
+                                            "caller_accessor_property": name[:160],
+                                            "owner_class_line": owner_line,
+                                            "property": referenced_name[:160],
+                                            "access": access,
+                                            "line": accessor_child.start_point[0] + 1,
+                                        })
+                                accessor_stack.extend(reversed(accessor_child.named_children))
             elif declaration.type == "signal_statement":
                 name = _node_text(declaration.child_by_field_name("name"), source)
                 params = _node_text(declaration.child_by_field_name("parameters"), source)
@@ -1021,7 +1304,7 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                 value_type = value_node.type if value_node is not None else ""
                 add_member(owner_id, name, "script_constant", declaration, {"godot_value_kind": value_type})
 
-    visit_class(root, script_class_id, class_line)
+    visit_class(root, script_class_id, class_line, class_name or stem)
     if call_references:
         script_metadata["call_references"] = call_references[:50_000]
     if receiver_bindings:

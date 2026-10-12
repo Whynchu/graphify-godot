@@ -169,13 +169,20 @@ def _receiver_bindings_for_reference(
     """
     owner_line = str(reference.get("owner_class_line") or "")
     caller_line = str(reference.get("caller_line") or "")
+    caller_kind = str(reference.get("caller_kind") or "")
+    caller_column = str(reference.get("caller_column") or "")
     all_bindings = [
         binding for binding in facts.get("receiver_bindings", [])
         if isinstance(binding, dict)
         and str(binding.get("name") or "") == receiver_name
         and str(binding.get("owner_class_line") or "") == owner_line
     ]
-    local = [binding for binding in all_bindings if str(binding.get("caller_line") or "") == caller_line]
+    local = [
+        binding for binding in all_bindings
+        if str(binding.get("caller_line") or "") == caller_line
+        and str(binding.get("caller_kind") or "") == caller_kind
+        and (caller_kind != "lambda" or str(binding.get("caller_column") or "") == caller_column)
+    ]
     if not local:
         return [binding for binding in all_bindings if not binding.get("caller_line")], False, False
 
@@ -197,6 +204,36 @@ def _receiver_bindings_for_reference(
     if any(binding.get("invalidated") for binding in latest):
         return [], True, True
     return latest, False, True
+
+
+def _indexed_element_type(type_text: str, depth: int) -> str:
+    """Resolve an indexed Array/Dictionary value type, including nesting."""
+    current = type_text.strip()
+    for _ in range(max(0, min(depth, 16))):
+        opening = current.find("[")
+        if opening <= 0 or not current.endswith("]"):
+            return ""
+        container = current[:opening].strip()
+        body = current[opening + 1:-1]
+        parts: list[str] = []
+        start = 0
+        nesting = 0
+        for index, char in enumerate(body):
+            if char == "[":
+                nesting += 1
+            elif char == "]":
+                nesting = max(0, nesting - 1)
+            elif char == "," and nesting == 0:
+                parts.append(body[start:index].strip())
+                start = index + 1
+        parts.append(body[start:].strip())
+        if container in {"Array", "TypedArray"} and len(parts) == 1:
+            current = parts[0]
+        elif container == "Dictionary" and len(parts) == 2:
+            current = parts[1]
+        else:
+            return ""
+    return current
 
 
 def _append_reference_edge(
@@ -305,10 +342,16 @@ def resolve_godot_resources(
             verification_manifests.append({"node": node, "facts": manifest_facts})
         if kind == "script_class":
             classes_by_project[(project_id, str(node.get("label") or ""))].append(node)
+            qualified_name = str(metadata.get("godot_qualified_class_name") or "")
+            if qualified_name and qualified_name != str(node.get("label") or ""):
+                classes_by_project[(project_id, qualified_name)].append(node)
             if metadata.get("godot_global_class"):
                 global_classes_by_project[(project_id, str(node.get("label") or ""))].append(node)
         elif kind == "script_inner_class":
             classes_by_project[(project_id, str(node.get("label") or ""))].append(node)
+            qualified_name = str(metadata.get("godot_qualified_class_name") or "")
+            if qualified_name:
+                classes_by_project[(project_id, qualified_name)].append(node)
 
     for edge in all_edges:
         if edge.get("relation") == "method":
@@ -615,13 +658,20 @@ def resolve_godot_resources(
                 extra={"godot_script_binding": str(reference.get("binding") or "")},
             )
             binding = str(reference.get("binding") or "")
-            if kind == "preload" and binding:
-                alias_script = target if _meta(target).get("godot_kind") == "script_class" else resource_script_attachments.get(str(target.get("id") or ""))
+            target_kind = str(_meta(target).get("godot_kind") or "")
+            if binding and (
+                (kind == "preload" and target_kind == "script_class")
+                or target_kind in {"resource", "sub_resource"}
+            ):
+                alias_script = (
+                    target if kind == "preload" and target_kind == "script_class"
+                    else resource_script_attachments.get(str(target.get("id") or ""))
+                )
                 if alias_script is not None:
                     owner_line = f"L{max(1, int(reference.get('owner_class_line') or 1))}"
                     preload_aliases_by_scope[(key, owner_line, binding)].append({
                         "script": alias_script,
-                        "instance_resource": _meta(target).get("godot_kind") != "script_class",
+                        "instance_resource": target_kind != "script_class",
                     })
 
         for reference in facts.get("class_references", []):
@@ -660,6 +710,24 @@ def resolve_godot_resources(
             if str(method.get("label") or "").strip().lstrip(".").removesuffix("()") == method_name
         ]
 
+    def caller_candidates_for(file: dict, class_id: str, reference: dict, caller_name: str, caller_line: str) -> list[dict]:
+        if str(reference.get("caller_kind") or "") == "lambda":
+            owner_line = str(max(1, int(reference.get("owner_class_line") or 1)))
+            method_line = str(max(1, int(reference.get("caller_method_line") or 1)))
+            column = str(max(1, int(reference.get("caller_column") or 1)))
+            return [
+                node for node in nodes_by_resource_path.get(file["key"], [])
+                if _meta(node).get("godot_kind") == "script_lambda"
+                and str(node.get("source_location") or "") == caller_line
+                and str(_meta(node).get("godot_owner_class_line") or "") == owner_line
+                and str(_meta(node).get("godot_enclosing_method_line") or "") == method_line
+                and str(_meta(node).get("godot_lambda_column") or "") == column
+            ]
+        return [
+            method for method in method_named(class_id, caller_name)
+            if str(method.get("source_location") or "") == caller_line
+        ]
+
     def find_method(class_id: str, method_name: str, *, skip_class: bool = False) -> dict | None:
         seen: set[str] = set()
         current = class_id
@@ -696,6 +764,21 @@ def resolve_godot_resources(
                 return None, "not_in_project_hierarchy"
             current = bases[0]
         return None, "inheritance_cycle"
+
+    def inferred_return_type_from_binding(file: dict, binding: dict) -> str:
+        call = binding.get("inferred_return_call")
+        if not isinstance(call, dict) or call.get("receiver_kind") != "class":
+            return ""
+        receiver_name = str(call.get("receiver") or "")
+        method_name = str(call.get("callee") or "")
+        classes = classes_by_project.get((file["project_id"], receiver_name), [])
+        if len(classes) != 1 or not method_name:
+            return ""
+        method, _reason = find_method_with_reason(str(classes[0].get("id") or ""), method_name)
+        if method is None or not _meta(method).get("godot_static"):
+            return ""
+        return_type = str(_meta(method).get("godot_return_type") or "").strip()
+        return return_type if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", return_type) else ""
 
     base_classes: dict[str, list[str]] = defaultdict(list)
     for edge in all_edges:
@@ -741,10 +824,9 @@ def resolve_godot_resources(
                 owner_class = owner_candidates[0]
             caller_line = f"L{max(1, int(reference.get('caller_line') or 1))}"
             caller_name = str(reference.get("caller_name") or "")
-            caller_candidates = [
-                method for method in method_named(str(owner_class.get("id") or ""), caller_name)
-                if str(method.get("source_location") or "") == caller_line
-            ]
+            caller_candidates = caller_candidates_for(
+                file, str(owner_class.get("id") or ""), reference, caller_name, caller_line
+            )
             caller = caller_candidates[0] if len(caller_candidates) == 1 else owner_class
             for scene_key, owner_path in attached_rows:
                 scene_nodes = scene_nodes_for(scene_key).values()
@@ -828,8 +910,7 @@ def resolve_godot_resources(
                 if len(owner_candidates) != 1:
                     continue
                 owner_id = str(owner_candidates[0].get("id") or "")
-            caller_candidates = [method for method in method_named(owner_id, caller_name)
-                                 if str(method.get("source_location") or "") == caller_line]
+            caller_candidates = caller_candidates_for(file, owner_id, reference, caller_name, caller_line)
             caller_id = str(caller_candidates[0].get("id") or "") if len(caller_candidates) == 1 else ""
             method_name = str(reference.get("callee") or "")
             receiver_kind = str(reference.get("receiver_kind") or "unqualified")
@@ -850,7 +931,7 @@ def resolve_godot_resources(
                     target_classes = [bases[0]]
             elif receiver_kind == "class":
                 receiver_name = str(reference.get("receiver") or "")
-                matches = global_classes_by_project.get((file["project_id"], receiver_name), [])
+                matches = classes_by_project.get((file["project_id"], receiver_name), [])
                 if len(matches) == 1:
                     target_classes = [str(matches[0].get("id") or "")]
                 elif len(matches) > 1:
@@ -885,11 +966,20 @@ def resolve_godot_resources(
                 type_names = {str(binding.get("type") or "").strip() for binding in binding_matches}
                 if len(type_names) == 1:
                     type_name = next(iter(type_names))
+                    if not type_name:
+                        return_types = {
+                            inferred_return_type_from_binding(file, binding)
+                            for binding in binding_matches
+                        } - {""}
+                        if len(return_types) == 1:
+                            type_name = next(iter(return_types))
+                            inferred_receiver = True
                     if reference.get("receiver_indexed"):
-                        array_type = re.fullmatch(r"(?:Array|TypedArray)\s*\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]", type_name)
-                        dictionary_type = re.fullmatch(r"Dictionary\s*\[\s*[A-Za-z_][A-Za-z0-9_]*\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]", type_name)
-                        type_name = (array_type or dictionary_type).group(1) if array_type or dictionary_type else ""
-                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", type_name):
+                        type_name = _indexed_element_type(
+                            type_name,
+                            int(reference.get("receiver_indexed_depth") or 1),
+                        )
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", type_name):
                         type_candidates = classes_by_project.get((file["project_id"], type_name), [])
                         if len(type_candidates) == 1:
                             target_classes = [str(type_candidates[0].get("id") or "")]
@@ -902,6 +992,22 @@ def resolve_godot_resources(
                                 inferred_receiver = any(bool(binding.get("inferred")) for binding in binding_matches)
                             elif len(aliases) > 1:
                                 _append_script_diagnostic(file["node"], f"Preload alias type {type_name!r} is ambiguous in this script scope.", int(reference.get("line") or 1))
+                if not target_classes and not binding_invalidated:
+                    loaded_resources = [
+                        alias for alias in preload_aliases_by_scope.get((file["key"], owner_line, receiver_name), [])
+                        if alias.get("instance_resource")
+                    ]
+                    if len(loaded_resources) == 1:
+                        target_classes = [str(loaded_resources[0]["script"].get("id") or "")]
+                        preload_receiver_instance = True
+                        inferred_receiver = True
+                    elif len(loaded_resources) > 1:
+                        _append_script_diagnostic(
+                            file["node"],
+                            f"Loaded resource receiver {receiver_name!r} maps to multiple indexed scripts.",
+                            int(reference.get("line") or 1),
+                            kind="godot_ambiguous_receiver_method",
+                        )
                 if not target_classes and (not local_receiver_binding or not binding_invalidated):
                     scene_targets = node_receiver_script_targets.get((file["key"][1], owner_line, caller_line, receiver_name), set())
                     if len(scene_targets) == 1:
@@ -1006,6 +1112,15 @@ def resolve_godot_resources(
                 _append_script_diagnostic(file["node"], "Runtime set_script() assignment can change an object's script outside serialized scene/resource attachments.", line)
             elif kind == "runtime_node_injection":
                 _append_script_diagnostic(file["node"], "Runtime add_child() injection can add nodes not present in indexed scene resources.", line)
+            elif kind == "dynamic_property_access":
+                operation = str(reference.get("operation") or "get/set")
+                access = str(reference.get("access") or "property")
+                _append_script_diagnostic(
+                    file["node"],
+                    f"Dynamic property {operation}() remains unresolved because the property name is computed at runtime; {access} access has no statically identified target.",
+                    line,
+                    kind="godot_dynamic_property_access",
+                )
 
     property_nodes_by_owner: dict[str, list[dict]] = defaultdict(list)
     signal_nodes_by_owner: dict[str, list[dict]] = defaultdict(list)
@@ -1018,6 +1133,15 @@ def resolve_godot_resources(
             property_nodes_by_owner[str(owner.get("id"))].append(member)
         if owner and member and _meta(member).get("godot_kind") == "script_signal":
             signal_nodes_by_owner[str(owner.get("id"))].append(member)
+
+    inline_accessors_by_property: dict[str, list[dict]] = defaultdict(list)
+    for edge in all_edges:
+        if edge.get("relation") != "contains" or edge.get("context") != "godot_inline_property_accessor":
+            continue
+        owner = nodes_by_id.get(str(edge.get("source") or ""))
+        accessor = nodes_by_id.get(str(edge.get("target") or ""))
+        if owner and accessor and _meta(accessor).get("godot_kind") == "script_accessor":
+            inline_accessors_by_property[str(owner.get("id") or "")].append(accessor)
 
     def find_property(class_id: str, property_name: str) -> dict | None:
         seen: set[str] = set()
@@ -1140,10 +1264,17 @@ def resolve_godot_resources(
                 owner_id = str(owner_candidates[0].get("id") or "")
             caller_name = str(reference.get("caller_name") or "")
             caller_line = f"L{max(1, int(reference.get('caller_line') or 1))}"
-            caller_candidates = [
-                method for method in method_named(owner_id, caller_name)
-                if str(method.get("source_location") or "") == caller_line
-            ]
+            if reference.get("caller_accessor"):
+                caller_candidates = [
+                    node for node in nodes_by_resource_path.get(file["key"], [])
+                    if _meta(node).get("godot_kind") == "script_accessor"
+                    and str(_meta(node).get("godot_accessor") or "") == str(reference.get("caller_accessor") or "")
+                    and str(_meta(node).get("godot_property") or "") == str(reference.get("caller_accessor_property") or "")
+                    and str(_meta(node).get("godot_owner_class_line") or "")
+                    == str(max(1, int(reference.get("owner_class_line") or 1)))
+                ]
+            else:
+                caller_candidates = caller_candidates_for(file, owner_id, reference, caller_name, caller_line)
             if len(caller_candidates) != 1:
                 continue
             property_name = str(reference.get("property") or "")
@@ -1178,6 +1309,18 @@ def resolve_godot_resources(
                 type_names = {str(binding.get("type") or "").strip() for binding in bindings}
                 if len(type_names) == 1:
                     type_name = next(iter(type_names))
+                    if not type_name:
+                        return_types = {
+                            inferred_return_type_from_binding(file, binding)
+                            for binding in bindings
+                        } - {""}
+                        if len(return_types) == 1:
+                            type_name = next(iter(return_types))
+                    if reference.get("receiver_indexed"):
+                        type_name = _indexed_element_type(
+                            type_name,
+                            int(reference.get("receiver_indexed_depth") or 1),
+                        )
                     type_matches = classes_by_project.get((file["project_id"], type_name), [])
                     if len(type_matches) == 1:
                         property_owner_ids = [str(type_matches[0].get("id") or "")]
@@ -1185,6 +1328,13 @@ def resolve_godot_resources(
                         aliases = preload_aliases_by_scope.get((file["key"], owner_line, type_name), [])
                         if len(aliases) == 1:
                             property_owner_ids = [str(aliases[0]["script"].get("id") or "")]
+                if not property_owner_ids and not binding_invalidated:
+                    loaded_resources = [
+                        alias for alias in preload_aliases_by_scope.get((file["key"], owner_line, receiver_name), [])
+                        if alias.get("instance_resource")
+                    ]
+                    if len(loaded_resources) == 1:
+                        property_owner_ids = [str(loaded_resources[0]["script"].get("id") or "")]
                 if not property_owner_ids and (not local_receiver_binding or not binding_invalidated):
                     scene_targets = node_receiver_script_targets.get((file["key"][1], owner_line, caller_line, receiver_name), set())
                     if len(scene_targets) == 1:
@@ -1216,6 +1366,30 @@ def resolve_godot_resources(
                 reference_kind=access,
                 extra={"godot_receiver": receiver_name[:160]} if receiver_name else None,
             )
+            access = str(reference.get("access") or "read")
+            accessor_kinds = (
+                {"getter", "setter"} if access == "read_write"
+                else {"getter"} if access in {"read", "read_only"}
+                else {"setter"} if access == "write"
+                else set()
+            )
+            for property_candidate in property_candidates:
+                for accessor in inline_accessors_by_property.get(str(property_candidate.get("id") or ""), []):
+                    accessor_metadata = _meta(accessor)
+                    if (
+                        accessor_metadata.get("godot_kind") == "script_accessor"
+                        and accessor_metadata.get("godot_accessor") in accessor_kinds
+                    ):
+                        _append_reference_edge(
+                            all_edges,
+                            caller_candidates[0],
+                            accessor,
+                            relation="references",
+                            context=f"godot_script_property_{accessor_metadata.get('godot_accessor')}",
+                            line=int(reference.get("line") or 1),
+                            property_name=property_name,
+                            reference_kind=str(accessor_metadata.get("godot_accessor") or ""),
+                        )
 
     for file in script_files:
         facts = file["facts"]
@@ -1241,8 +1415,7 @@ def resolve_godot_resources(
                 owner_id = str(owner_candidates[0].get("id") or "")
             caller_line = f"L{max(1, int(reference.get('caller_line') or 1))}"
             caller_name = str(reference.get("caller_name") or "")
-            callers = [method for method in method_named(owner_id, caller_name)
-                       if str(method.get("source_location") or "") == caller_line]
+            callers = caller_candidates_for(file, owner_id, reference, caller_name, caller_line)
             signal_name = str(reference.get("signal") or "")
             signal_node = find_signal(owner_id, signal_name)
             if len(callers) != 1 or signal_node is None:
@@ -1259,13 +1432,65 @@ def resolve_godot_resources(
                 reference_kind=event,
             )
             callback_name = str(reference.get("callback") or "")
-            if event == "connect" and callback_name:
-                callback = find_method(owner_id, callback_name)
-                if callback is not None:
+            if event == "connect" and int(reference.get("callback_lambda_line") or 0):
+                lambda_line = f"L{max(1, int(reference.get('callback_lambda_line') or 1))}"
+                lambda_column = str(max(1, int(reference.get("callback_lambda_column") or 1)))
+                lambda_candidates = [
+                    node for node in nodes_by_resource_path.get(file["key"], [])
+                    if _meta(node).get("godot_kind") == "script_lambda"
+                    and str(node.get("source_location") or "") == lambda_line
+                    and str(_meta(node).get("godot_owner_class_line") or "") == str(max(1, int(reference.get("owner_class_line") or 1)))
+                    and str(_meta(node).get("godot_lambda_column") or "") == lambda_column
+                ]
+                if len(lambda_candidates) == 1:
                     _append_reference_edge(
                         all_edges,
                         signal_node,
-                        callback,
+                        lambda_candidates[0],
+                        relation="references",
+                        context="godot_script_signal_callback",
+                        line=int(reference.get("line") or 1),
+                        property_name=signal_name,
+                        reference_kind="lambda_callback",
+                    )
+                else:
+                    _append_script_diagnostic(file["node"], f"Signal {signal_name!r} inline lambda callback did not identify one extracted lambda node.", int(reference.get("line") or 1))
+            elif event == "connect" and callback_name:
+                callback_receiver_kind = str(reference.get("callback_receiver_kind") or "unqualified")
+                callback_receiver = str(reference.get("callback_receiver") or "")
+                callback_classes = [owner_id] if callback_receiver_kind in {"self", "unqualified"} else []
+                if callback_receiver_kind == "class":
+                    callback_matches = classes_by_project.get((file["project_id"], callback_receiver), [])
+                    if len(callback_matches) == 1:
+                        callback_classes = [str(callback_matches[0].get("id") or "")]
+                elif callback_receiver_kind == "identifier":
+                    bindings, invalidated, _local = _receiver_bindings_for_reference(
+                        facts,
+                        reference,
+                        callback_receiver,
+                    )
+                    type_names = {str(binding.get("type") or "").strip() for binding in bindings} - {""}
+                    if not invalidated and len(type_names) == 1:
+                        callback_type = next(iter(type_names))
+                        type_matches = classes_by_project.get((file["project_id"], callback_type), [])
+                        if len(type_matches) == 1:
+                            callback_classes = [str(type_matches[0].get("id") or "")]
+                        else:
+                            aliases = preload_aliases_by_scope.get((file["key"], owner_line, callback_type), [])
+                            if len(aliases) == 1:
+                                callback_classes = [str(aliases[0]["script"].get("id") or "")]
+                callback_candidates = [
+                    find_method(class_id, callback_name)
+                    for class_id in callback_classes if class_id
+                ]
+                callback_candidates = [candidate for candidate in callback_candidates if candidate is not None]
+                if callback_receiver_kind == "class":
+                    callback_candidates = [candidate for candidate in callback_candidates if _meta(candidate).get("godot_static")]
+                if len(callback_candidates) == 1:
+                    _append_reference_edge(
+                        all_edges,
+                        signal_node,
+                        callback_candidates[0],
                         relation="references",
                         context="godot_script_signal_callback",
                         line=int(reference.get("line") or 1),
@@ -1273,8 +1498,15 @@ def resolve_godot_resources(
                         reference_kind="callback",
                         extra={"godot_callback_method": callback_name[:160]},
                     )
+                else:
+                    _append_script_diagnostic(
+                        file["node"],
+                        f"Signal {signal_name!r} callback {callback_name!r} remains unresolved because its receiver does not identify one indexed script method.",
+                        int(reference.get("line") or 1),
+                        kind="godot_dynamic_signal_callback",
+                    )
             elif event == "connect" and reference.get("callback_dynamic"):
-                _append_script_diagnostic(file["node"], f"Signal {signal_name!r} callback remains dynamic; callback syntax does not identify one method on a known receiver.", int(reference.get("line") or 1))
+                _append_script_diagnostic(file["node"], f"Signal {signal_name!r} callback remains dynamic; callback syntax does not identify one method on a known receiver.", int(reference.get("line") or 1), kind="godot_dynamic_signal_callback")
 
     # The runner inventory is a useful verification boundary in Godot projects:
     # connect each explicit CSV row to the script file it names. Keep this path
