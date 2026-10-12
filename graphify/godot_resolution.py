@@ -363,6 +363,8 @@ def resolve_godot_resources(
     autoload_scripts_by_name: dict[tuple[str, str], list[dict]] = defaultdict(list)
     preload_aliases_by_scope: dict[tuple[tuple[str, str], str, str], list[dict]] = defaultdict(list)
     inherited_scene_keys: dict[tuple[str, str], tuple[str, str]] = {}
+    scene_instance_keys: dict[tuple[tuple[str, str], str], tuple[str, str]] = {}
+    scene_instance_lines: dict[tuple[tuple[str, str], str], int] = {}
     unresolved_ext_ids: dict[tuple[str, str], set[str]] = {}
 
     def report(file: dict, message: str, line: int | None = None) -> None:
@@ -455,6 +457,15 @@ def resolve_godot_resources(
                     attached_scripts[(key, str(owner_metadata.get("godot_scene_path") or "."))] = target
                 elif is_script and owner_metadata.get("godot_kind") in {"resource", "sub_resource"} and _meta(target).get("godot_kind") == "script_class":
                     resource_script_attachments[str(owner.get("id") or "")] = target
+                if is_instance and _meta(target).get("godot_kind") == "scene":
+                    nested_key = _file_key(
+                        str(_meta(target).get("godot_project_id") or file["project_id"]),
+                        str(_meta(target).get("godot_res_path") or ""),
+                    )
+                    instance_path = str(owner_metadata.get("godot_scene_path") or ".")
+                    if nested_key:
+                        scene_instance_keys[(key, instance_path)] = nested_key
+                        scene_instance_lines[(key, instance_path)] = int(reference.get("line") or 1)
                 if (
                     is_instance
                     and str(owner_metadata.get("godot_scene_path") or ".") == "."
@@ -508,22 +519,87 @@ def resolve_godot_resources(
             current = inherited_scene_keys.get(current)  # type: ignore[assignment]
         return lineage
 
-    def scene_nodes_for(scene_key: tuple[str, str]) -> dict[str, dict]:
-        merged: dict[str, dict] = {}
-        for ancestor_key in reversed(scene_lineage(scene_key)):
+    scene_context_cache: dict[tuple[str, str], tuple[dict[str, dict], dict[str, dict]]] = {}
+
+    def join_scene_path(parent: str, child: str) -> str:
+        parent = _normalize_scene_path(parent)
+        child = _normalize_scene_path(child)
+        if child == ".":
+            return parent
+        if parent == ".":
+            return child
+        return _normalize_scene_path(f"{parent}/{child}")
+
+    def scene_context_for(
+        scene_key: tuple[str, str],
+        ancestors: tuple[tuple[str, str], ...] = (),
+    ) -> tuple[dict[str, dict], dict[str, dict]]:
+        if scene_key in ancestors:
+            return {}, {}
+        if scene_key in scene_context_cache:
+            return scene_context_cache[scene_key]
+        expanded_nodes: dict[str, dict] = {}
+        expanded_scripts: dict[str, dict] = {}
+        incomplete_context = False
+        next_ancestors = (*ancestors, scene_key)
+        lineage = scene_lineage(scene_key)
+        for ancestor_key in reversed(lineage):
+            for (instance_owner_key, instance_path), nested_key in scene_instance_keys.items():
+                if instance_owner_key != ancestor_key:
+                    continue
+                if instance_path == "." and inherited_scene_keys.get(ancestor_key) == nested_key:
+                    continue
+                if nested_key in next_ancestors:
+                    incomplete_context = True
+                    scene_file = files_by_key.get(ancestor_key)
+                    if scene_file:
+                        report(
+                            scene_file,
+                            f"Nested scene instance {instance_path!r} participates in a scene-instancing cycle; its descendants remain unresolved.",
+                            scene_instance_lines.get((ancestor_key, instance_path)),
+                        )
+                    continue
+                if len(next_ancestors) >= 64:
+                    incomplete_context = True
+                    scene_file = files_by_key.get(ancestor_key)
+                    if scene_file:
+                        report(
+                            scene_file,
+                            "Nested scene instance depth exceeds the static expansion limit of 64; deeper descendants remain unresolved.",
+                            scene_instance_lines.get((ancestor_key, instance_path)),
+                        )
+                    continue
+                nested_nodes, nested_scripts = scene_context_for(nested_key, next_ancestors)
+                if nested_key not in scene_context_cache:
+                    incomplete_context = True
+                for nested_path, nested_node in nested_nodes.items():
+                    host_path = join_scene_path(instance_path, nested_path)
+                    proxy = dict(nested_node)
+                    proxy_metadata = dict(_meta(nested_node))
+                    proxy_metadata["godot_scene_path"] = host_path
+                    proxy_metadata["godot_scene_instance_context"] = instance_path[:500]
+                    proxy["metadata"] = proxy_metadata
+                    expanded_nodes[host_path] = proxy
+                for nested_path, script in nested_scripts.items():
+                    expanded_scripts[join_scene_path(instance_path, nested_path)] = script
+
             for node in entities_by_file.get(ancestor_key, {}).values():
                 if _meta(node).get("godot_kind") != "scene_node":
                     continue
                 path = str(_meta(node).get("godot_scene_path") or ".")
-                merged[path] = node
-        return merged
+                expanded_nodes[path] = node
+                script = attached_scripts.get((ancestor_key, path))
+                if script is not None:
+                    expanded_scripts[path] = script
+        if not incomplete_context:
+            scene_context_cache[scene_key] = (expanded_nodes, expanded_scripts)
+        return expanded_nodes, expanded_scripts
+
+    def scene_nodes_for(scene_key: tuple[str, str]) -> dict[str, dict]:
+        return scene_context_for(scene_key)[0]
 
     def attached_script_for(scene_key: tuple[str, str], scene_path: str) -> dict | None:
-        for ancestor_key in scene_lineage(scene_key):
-            script = attached_scripts.get((ancestor_key, scene_path))
-            if script is not None:
-                return script
-        return None
+        return scene_context_for(scene_key)[1].get(_normalize_scene_path(scene_path))
 
     for scene_key in inherited_scene_keys:
         lineage = scene_lineage(scene_key)
@@ -604,6 +680,33 @@ def resolve_godot_resources(
             target, canonical_path, reason = _resolve_resource_path(
                 file, path, "", nodes_by_resource_path, uid_to_resource_keys
             )
+            if target is None and path.startswith("res://"):
+                plugin_key = _file_key(file["project_id"], path)
+                plugin_configs = [
+                    node for node in nodes_by_resource_path.get(plugin_key, [])
+                    if _meta(node).get("godot_kind") == "plugin_config"
+                ]
+                if len(plugin_configs) == 1:
+                    target = plugin_configs[0]
+                    canonical_path = path
+                    reason = ""
+                elif len(plugin_configs) > 1:
+                    reason = f"Plugin configuration path {path} matches multiple indexed plugin-config nodes."
+                project_source = str(file["node"].get("source_file") or "")
+                plugin_source = _source_path_key(
+                    posixpath.join(posixpath.dirname(project_source), path[6:])
+                )
+                plugin_files = [
+                    node for node in all_nodes
+                    if _source_path_key(node.get("source_file")) == plugin_source
+                    and _meta(node).get("godot_kind") in {None, "file"}
+                ]
+                if target is None and len(plugin_files) == 1:
+                    target = plugin_files[0]
+                    canonical_path = path
+                    reason = ""
+                elif target is None and len(plugin_files) > 1:
+                    reason = f"Plugin configuration path {path} matches multiple indexed files."
             if target is None:
                 report(file, f"Enabled editor plugin {path!r} cannot be resolved: {reason}", int(plugin.get("line") or 1))
                 continue

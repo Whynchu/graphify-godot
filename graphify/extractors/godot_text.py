@@ -1078,7 +1078,25 @@ def extract_godot_project(path: Path, *, root: Path | None = None) -> dict:
                 enabled_plugins["line"],
                 {"godot_plugin_path": plugin_path[:500]},
             )
-            project_facts["plugins"].append({"path": plugin_path[:500], "line": enabled_plugins["line"], "key": local_key})
+            plugin_fact = {"path": plugin_path[:500], "line": enabled_plugins["line"], "key": local_key}
+            if plugin_path.startswith("res://"):
+                plugin_cfg_path = path.parent / plugin_path[6:]
+                if plugin_cfg_path.is_file():
+                    config_key = f"plugin-config:{index}:{plugin_path}"
+                    config_node = add_project_entity(
+                        config_key,
+                        _make_id(project_id, "plugin_config", plugin_path),
+                        plugin_path.rsplit("/", 1)[-1],
+                        "plugin_config",
+                        enabled_plugins["line"],
+                        {
+                            "godot_plugin_config_path": plugin_path[:500],
+                            "godot_res_path": plugin_path[:500],
+                        },
+                    )
+                    config_node["source_file"] = str(plugin_cfg_path)
+                    plugin_fact["config_key"] = config_key
+            project_facts["plugins"].append(plugin_fact)
 
     return {
         "nodes": nodes,

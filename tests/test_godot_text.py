@@ -83,6 +83,24 @@ def test_project_settings_resolve_main_scene_and_autoload_calls(tmp_path: Path):
     assert ("tick", "reset", "godot_gdscript_call") in contexts
 
 
+def test_project_enabled_plugin_links_to_indexed_plugin_cfg(tmp_path: Path):
+    plugin_cfg = tmp_path / "addons" / "sample_plugin" / "plugin.cfg"
+    plugin_cfg.parent.mkdir(parents=True)
+    plugin_cfg.write_text('[plugin]\nname="Sample Plugin"\n', encoding="utf-8")
+    project = tmp_path / "project.godot"
+    project.write_text(
+        '[editor_plugins]\n'
+        'enabled=PackedStringArray("res://addons/sample_plugin/plugin.cfg")\n',
+        encoding="utf-8",
+    )
+
+    result = extract([project, plugin_cfg], root=tmp_path, parallel=False)
+    nodes = {node["id"]: node for node in result["nodes"]}
+    plugin_edges = [edge for edge in result["edges"] if edge.get("context") == "godot_project_plugin"]
+    assert len(plugin_edges) == 1
+    assert nodes[plugin_edges[0]["target"]].get("source_file", "").replace("\\", "/") == "addons/sample_plugin/plugin.cfg"
+
+
 def test_project_config_header_and_semicolon_comments_are_valid(tmp_path: Path):
     project = tmp_path / "project.godot"
     project.write_text(
@@ -207,6 +225,273 @@ def test_inherited_scene_nodes_and_attached_scripts_resolve_for_node_paths(tmp_p
 
     assert any(labels[edge["target"]] == "Child" for edge in node_paths)
     assert any(labels[edge["source"]] == "use_child" and labels[edge["target"]] == "ping" for edge in attached_calls)
+
+
+@_needs_gdscript
+def test_nested_scene_instances_resolve_node_paths_and_attached_script_calls(tmp_path: Path):
+    _write_project(tmp_path)
+    leaf_script = tmp_path / "leaf_actor.gd"
+    leaf_script.write_text("class_name LeafActor\nfunc ping() -> void: pass\n", encoding="utf-8")
+    decoy_script = tmp_path / "decoy_actor.gd"
+    decoy_script.write_text("class_name DecoyActor\nfunc ping() -> void: pass\n", encoding="utf-8")
+    caller_script = tmp_path / "nested_caller.gd"
+    caller_script.write_text(
+        "class_name NestedCaller\n"
+        "func use_nested() -> void:\n"
+        '    var first = get_node("A/Leaf/Target")\n'
+        "    first.ping()\n"
+        '    var second = get_node("B/Leaf/Target")\n'
+        "    second.ping()\n",
+        encoding="utf-8",
+    )
+    leaf_scene = tmp_path / "leaf.tscn"
+    leaf_scene.write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://leaf_actor.gd" id="actor"]\n'
+        '[node name="LeafRoot" type="Node"]\n'
+        '[node name="Target" type="Node" parent="."]\n'
+        'script = ExtResource("actor")\n',
+        encoding="utf-8",
+    )
+    wrapper_scene = tmp_path / "wrapper.tscn"
+    wrapper_scene.write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="PackedScene" path="res://leaf.tscn" id="leaf"]\n'
+        '[node name="Wrapper" type="Node"]\n'
+        '[node name="Leaf" parent="." instance=ExtResource("leaf")]\n',
+        encoding="utf-8",
+    )
+    main_scene = tmp_path / "main.tscn"
+    main_scene.write_text(
+        '[gd_scene load_steps=3 format=3]\n'
+        '[ext_resource type="Script" path="res://nested_caller.gd" id="caller"]\n'
+        '[ext_resource type="PackedScene" path="res://wrapper.tscn" id="wrapper"]\n'
+        '[node name="Main" type="Node"]\n'
+        'script = ExtResource("caller")\n'
+        '[node name="A" parent="." instance=ExtResource("wrapper")]\n'
+        '[node name="B" parent="." instance=ExtResource("wrapper")]\n',
+        encoding="utf-8",
+    )
+
+    result = extract(
+        [leaf_script, decoy_script, caller_script, leaf_scene, wrapper_scene, main_scene],
+        root=tmp_path,
+        parallel=False,
+    )
+    nodes = {node["id"]: node for node in result["nodes"]}
+    labels = {node_id: node["label"].strip().lstrip(".").removesuffix("()") for node_id, node in nodes.items()}
+    use_nested = next(node for node in result["nodes"] if node.get("label") == "use_nested()")
+    leaf_ping = next(
+        node for node in result["nodes"]
+        if node.get("label") == "ping()" and node.get("source_file", "").endswith("leaf_actor.gd")
+    )
+    decoy_ping = next(
+        node for node in result["nodes"]
+        if node.get("label") == "ping()" and node.get("source_file", "").endswith("decoy_actor.gd")
+    )
+    path_edges = [edge for edge in result["edges"] if edge.get("context") == "godot_script_node_path"]
+    attached_calls = [
+        edge for edge in result["edges"]
+        if edge.get("context") == "godot_scene_attached_call" and edge.get("relation") == "calls"
+    ]
+    assert {edge.get("metadata", {}).get("godot_target_node_path") for edge in path_edges} >= {
+        "A/Leaf/Target", "B/Leaf/Target",
+    }
+    assert len(attached_calls) == 2
+    assert {edge["source"] for edge in attached_calls} == {use_nested["id"]}
+    assert {edge["target"] for edge in attached_calls} == {leaf_ping["id"]}
+    assert decoy_ping["id"] not in {edge["target"] for edge in attached_calls}
+    assert all(labels[edge["target"]] == "ping" for edge in attached_calls)
+
+
+@_needs_gdscript
+def test_same_script_attached_to_different_scene_targets_stays_ambiguous(tmp_path: Path):
+    _write_project(tmp_path)
+    caller_script = tmp_path / "shared_caller.gd"
+    caller_script.write_text(
+        "class_name SharedCaller\n"
+        "func run() -> void:\n"
+        '    var target = get_node("Target")\n'
+        "    target.ping()\n",
+        encoding="utf-8",
+    )
+    scripts = []
+    scenes = []
+    for name in ("First", "Second"):
+        target_script = tmp_path / f"{name.lower()}_target.gd"
+        target_script.write_text(f"class_name {name}Target\nfunc ping() -> void: pass\n", encoding="utf-8")
+        scripts.append(target_script)
+        scene = tmp_path / f"{name.lower()}.tscn"
+        scene.write_text(
+            '[gd_scene load_steps=3 format=3]\n'
+            '[ext_resource type="Script" path="res://shared_caller.gd" id="caller"]\n'
+            f'[ext_resource type="Script" path="res://{name.lower()}_target.gd" id="target"]\n'
+            '[node name="Root" type="Node"]\n'
+            'script = ExtResource("caller")\n'
+            '[node name="Target" type="Node" parent="."]\n'
+            'script = ExtResource("target")\n',
+            encoding="utf-8",
+        )
+        scenes.append(scene)
+
+    result = extract([caller_script, *scripts, *scenes], root=tmp_path, parallel=False)
+    calls = [
+        edge for edge in result["edges"]
+        if edge.get("relation") == "calls" and edge.get("context") == "godot_scene_attached_call"
+    ]
+    caller_file = next(node for node in result["nodes"] if node.get("label") == "shared_caller.gd")
+    diagnostics = caller_file["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert not calls
+    assert any("resolves to multiple attached scripts" in item.get("message", "") for item in diagnostics)
+
+
+@_needs_gdscript
+def test_inherited_node_override_replaces_base_script_attachment(tmp_path: Path):
+    _write_project(tmp_path)
+    base_script = tmp_path / "base_child.gd"
+    base_script.write_text("class_name BaseChild\nfunc ping() -> void: pass\n", encoding="utf-8")
+    override_script = tmp_path / "override_child.gd"
+    override_script.write_text("class_name OverrideChild\nfunc ping() -> void: pass\n", encoding="utf-8")
+    caller_script = tmp_path / "derived_caller.gd"
+    caller_script.write_text(
+        "class_name DerivedCaller\n"
+        "func use_child() -> void:\n"
+        '    var child = get_node("Child")\n'
+        "    child.ping()\n",
+        encoding="utf-8",
+    )
+    base_scene = tmp_path / "base.tscn"
+    base_scene.write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://base_child.gd" id="base"]\n'
+        '[node name="Root" type="Node"]\n'
+        '[node name="Child" type="Node" parent="."]\n'
+        'script = ExtResource("base")\n',
+        encoding="utf-8",
+    )
+    derived_scene = tmp_path / "derived.tscn"
+    derived_scene.write_text(
+        '[gd_scene load_steps=5 format=3]\n'
+        '[ext_resource type="PackedScene" path="res://base.tscn" id="base_scene"]\n'
+        '[ext_resource type="Script" path="res://override_child.gd" id="override"]\n'
+        '[ext_resource type="Script" path="res://base_child.gd" id="base_script"]\n'
+        '[ext_resource type="Script" path="res://derived_caller.gd" id="caller"]\n'
+        '[node name="Root" instance=ExtResource("base_scene")]\n'
+        'script = ExtResource("caller")\n'
+        '[node name="Child" parent="." type="Node"]\n'
+        'script = ExtResource("override")\n',
+        encoding="utf-8",
+    )
+
+    result = extract(
+        [base_script, override_script, caller_script, base_scene, derived_scene],
+        root=tmp_path,
+        parallel=False,
+    )
+    nodes = {node["id"]: node for node in result["nodes"]}
+    override_ping = next(
+        node for node in result["nodes"]
+        if node.get("label") == "ping()" and node.get("source_file", "").endswith("override_child.gd")
+    )
+    base_ping = next(
+        node for node in result["nodes"]
+        if node.get("label") == "ping()" and node.get("source_file", "").endswith("base_child.gd")
+    )
+    calls = [
+        edge for edge in result["edges"]
+        if edge.get("context") == "godot_scene_attached_call" and edge.get("relation") == "calls"
+    ]
+    assert len(calls) == 1
+    assert calls[0]["target"] == override_ping["id"]
+    assert calls[0]["target"] != base_ping["id"]
+
+    unchanged_nodes = [
+        node for node in result["nodes"]
+        if Path(str(node.get("source_file", ""))).name != derived_scene.name
+    ]
+    unchanged_edges = [
+        edge for edge in result["edges"]
+        if Path(str(edge.get("source_file", ""))).name != derived_scene.name
+    ]
+    derived_scene.write_text(
+        '[gd_scene load_steps=5 format=3]\n'
+        '[ext_resource type="PackedScene" path="res://base.tscn" id="base_scene"]\n'
+        '[ext_resource type="Script" path="res://override_child.gd" id="override"]\n'
+        '[ext_resource type="Script" path="res://base_child.gd" id="base_script"]\n'
+        '[ext_resource type="Script" path="res://derived_caller.gd" id="caller"]\n'
+        '[node name="Root" instance=ExtResource("base_scene")]\n'
+        'script = ExtResource("caller")\n'
+        '[node name="Child" parent="." type="Node"]\n'
+        'script = ExtResource("base_script")\n',
+        encoding="utf-8",
+    )
+    incremental = extract(
+        [derived_scene],
+        root=tmp_path,
+        parallel=False,
+        resolution_context_nodes=unchanged_nodes,
+        resolution_context_edges=unchanged_edges,
+    )
+    incremental_calls = [
+        edge for edge in incremental["edges"]
+        if edge.get("context") == "godot_scene_attached_call" and edge.get("relation") == "calls"
+    ]
+    assert len(incremental_calls) == 1
+    assert incremental_calls[0]["target"] == base_ping["id"]
+
+
+def test_nested_scene_instance_cycles_are_reported_without_recursion(tmp_path: Path):
+    _write_project(tmp_path)
+    scene_a = tmp_path / "a.tscn"
+    scene_b = tmp_path / "b.tscn"
+    scene_a.write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="PackedScene" path="res://b.tscn" id="b"]\n'
+        '[node name="A" type="Node"]\n'
+        '[node name="B" parent="." instance=ExtResource("b")]\n',
+        encoding="utf-8",
+    )
+    scene_b.write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="PackedScene" path="res://a.tscn" id="a"]\n'
+        '[node name="B" type="Node"]\n'
+        '[node name="A" parent="." instance=ExtResource("a")]\n',
+        encoding="utf-8",
+    )
+
+    result = extract([scene_a, scene_b], root=tmp_path, parallel=False)
+    messages = [
+        diagnostic.get("message", "")
+        for node in result["nodes"]
+        for diagnostic in (node.get("metadata", {}).get("godot_text", {}).get("diagnostics", []))
+    ]
+    assert any("scene-instancing cycle" in message for message in messages)
+
+
+def test_deep_scene_instance_chain_stops_at_documented_limit(tmp_path: Path):
+    _write_project(tmp_path)
+    scenes = []
+    for index in range(66):
+        scene = tmp_path / f"scene_{index}.tscn"
+        scenes.append(scene)
+        if index < 65:
+            scene.write_text(
+                '[gd_scene load_steps=2 format=3]\n'
+                f'[ext_resource type="PackedScene" path="res://scene_{index + 1}.tscn" id="next"]\n'
+                f'[node name="Root{index}" type="Node"]\n'
+                f'[node name="Child{index}" parent="." instance=ExtResource("next")]\n',
+                encoding="utf-8",
+            )
+        else:
+            scene.write_text(f'[gd_scene format=3]\n[node name="Root{index}" type="Node"]\n', encoding="utf-8")
+
+    result = extract(scenes, root=tmp_path, parallel=False)
+    messages = [
+        diagnostic.get("message", "")
+        for node in result["nodes"]
+        for diagnostic in (node.get("metadata", {}).get("godot_text", {}).get("diagnostics", []))
+    ]
+    assert any("static expansion limit of 64" in message for message in messages)
 
 
 def test_resource_parser_keeps_nested_links_and_never_scans_strings(tmp_path: Path):
