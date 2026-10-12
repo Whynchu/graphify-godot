@@ -3787,6 +3787,31 @@ def dispatch_command(cmd: str) -> None:
                     existing_graph_path, target, _seen_files, detection=detection
                 )
 
+        # A deletion can change UID/resource resolution for callers whose
+        # source files did not change. Re-extract one surviving Godot text file
+        # to run the resolver over the unchanged graph context; otherwise the
+        # old edge may be dropped as dangling without a fresh unresolved-target
+        # diagnostic on its caller.
+        if incremental_mode and deleted_files:
+            _deleted_godot_resource = any(
+                str(_path).replace("\\", "/").lower().endswith((
+                    ".gd", ".gd.uid", ".tres", ".tscn", ".godot", ".uid",
+                ))
+                for _path in deleted_files
+            )
+            _has_godot_trigger = any(Path(_path).suffix.lower() == ".gd" for _path in code_files)
+            if _deleted_godot_resource and not _has_godot_trigger:
+                _godot_trigger = next((
+                    Path(_path) for _path in files_by_type.get("code", [])
+                    if Path(_path).suffix.lower() in {".gd", ".tres", ".tscn", ".godot"}
+                ), None)
+                if _godot_trigger is not None:
+                    code_files.append(_godot_trigger)
+                    print(
+                        "[graphify extract] refreshing Godot references after a resource deletion "
+                        f"via {_godot_trigger.name}"
+                    )
+
         semantic_files = doc_files + paper_files + image_files
         # --code-only: index code (pure local AST, no key) and skip the semantic
         # (doc/paper/image) pass entirely, so a mixed repo doesn't hard-fail when no
@@ -4442,6 +4467,29 @@ def dispatch_command(cmd: str) -> None:
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
             "extracted_sources": list(ast_result.get("extracted_sources", [])),
         }
+        _godot_metadata_updates = ast_result.get("node_metadata_updates", [])
+
+        def _apply_godot_metadata_updates(_node_index) -> None:
+            for _update in _godot_metadata_updates:
+                if not isinstance(_update, dict):
+                    continue
+                _node = _node_index.get(str(_update.get("id") or ""))
+                _new_metadata = _update.get("metadata")
+                if _node is None or not isinstance(_new_metadata, dict):
+                    continue
+                _metadata = _node.setdefault("metadata", {})
+                if not isinstance(_metadata, dict):
+                    _metadata = {}
+                    _node["metadata"] = _metadata
+                for _key, _value in _new_metadata.items():
+                    if not isinstance(_value, dict):
+                        _metadata[_key] = _value
+                        continue
+                    _nested = _metadata.setdefault(_key, {})
+                    if not isinstance(_nested, dict):
+                        _nested = {}
+                        _metadata[_key] = _nested
+                    _nested.update(_value)
 
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"
@@ -4576,6 +4624,10 @@ def dispatch_command(cmd: str) -> None:
                     # raw-dump this run's partial extraction over it.
                     print(f"error: {exc}", file=sys.stderr)
                     sys.exit(1)
+                _apply_godot_metadata_updates({
+                    str(_node.get("id") or ""): _node
+                    for _node in merged.get("nodes", [])
+                })
                 _shrink = _handle_unverified_semantic_shrink(
                     merged.get("_unverified_semantic_shrink"),
                     cli_allow_partial=cli_allow_partial,
@@ -4728,6 +4780,7 @@ def dispatch_command(cmd: str) -> None:
                     dedup_llm_backend=dedup_backend,
                     root=target,
                 )
+                _apply_godot_metadata_updates(G.nodes)
                 _shrink = _handle_unverified_semantic_shrink(
                     G.graph.get("_unverified_semantic_shrink") if hasattr(G, "graph") else None,
                     cli_allow_partial=cli_allow_partial,

@@ -78,6 +78,81 @@ jobs:
           uv run --frozen graphify --help
           uv run --frozen graphify install
 
+  build-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel and source archive
+        run: |
+          python -m pip install build
+          python -m build --wheel --sdist --outdir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graphifyy-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 2
+
+  godot-package-install:
+    needs: build-package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+        package-format: [wheel, sdist]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: graphifyy-distributions
+          path: dist
+
+      - name: Create isolated environment
+        run: python -m venv .venv
+
+      - name: Install ${{ matrix.package-format }} with Godot extra
+        run: python tools/install_godot_artifact.py ${{ matrix.package-format }} --godot
+
+      - name: Verify installed package extracts Godot sources
+        run: python tools/check_godot_package_install.py
+
+  godot-missing-extra:
+    needs: build-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: graphifyy-distributions
+          path: dist
+
+      - name: Create isolated environment
+        run: python -m venv .venv
+
+      - name: Install base wheel without Godot extra
+        run: python tools/install_godot_artifact.py wheel
+
+      - name: Verify missing-grammar diagnostic is actionable
+        run: python tools/check_godot_missing_extra.py
+
   security-scan:
     # The dev deps include bandit and pip-audit. Run them in CI so a new
     # HIGH-severity finding or vulnerable dependency is caught on the PR that

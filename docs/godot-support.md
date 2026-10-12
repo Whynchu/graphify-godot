@@ -22,7 +22,25 @@ For planned completion gates, see the Tiny Demons
 | Scene/resource files | Partial | `test_resource_parser_keeps_nested_links_and_never_scans_strings`, `test_gdscript_node_paths_unique_names_and_attached_receiver_calls`, `test_inherited_scene_nodes_and_attached_scripts_resolve_for_node_paths`, `test_nested_scene_instances_resolve_node_paths_and_attached_script_calls`, `test_inherited_node_override_replaces_base_script_attachment`, `test_nested_scene_instance_cycles_are_reported_without_recursion`, `test_deep_scene_instance_chain_stops_at_documented_limit` | Reads text `.tres` / `.tscn`, external and subresources, explicit script attachments, nested scene instances, root inherited scenes and node overrides, serialized signals, literal `$Path`, `%UniqueName`, and `get_node()` paths. Instanced node paths retain the host-scene context; cycles are diagnosed and expansion stops at 64 nested scenes. Absolute NodePaths, binary scenes/resources and all Godot override edge cases remain outside the static model. |
 | Dynamic boundary evidence | Partial | `test_dynamic_godot_boundaries_report_reasons_without_guessed_edges` | Reports common computed loads, unresolved `call`/`call_deferred`, group lookups/dispatch, `set_script`, `add_child`, and dynamic signal callbacks. Literal `call()` targets resolve only with a unique supported receiver. This is a bounded inventory, not a complete model of reflection or runtime injection. |
 | Source-group HTML filters | Implemented across graph, tree, and callflow HTML | `tests/test_export.py::test_html_source_groups_classify_paths_and_explicit_overrides`, `test_html_source_and_community_filters_intersect_at_runtime`, `test_html_aggregated_communities_retain_source_group_membership`, `test_html_aggregates_recompute_group_member_and_link_counts`, `tests/test_tree_html.py::test_build_tree_tracks_source_groups_and_grouped_truncation`, `test_tree_filtering_recomputes_visible_symbol_totals`, `tests/test_callflow_html.py::test_callflow_source_group_filters_annotate_rows_and_relationships`, `test_callflow_call_table_keeps_a_bounded_sample_per_source_group`, `test_callflow_source_group_filter_runtime_hides_excluded_rows_and_refs` | Docs, Tests, Scripts, Scenes, Resources, Tools, Addons, Config, and Other use one path/override classifier in all three HTML views. Graph filters intersect with community visibility, search, edge contributions, selection, and URL state. Oversized graph summaries retain per-group node and cross-community edge counts and recompute visible totals; communities remain aggregate nodes without individual-member drilldown. Tree filters symbols, recomputes directory counts and URL state, and attributes per-file truncation summaries to groups. Callflow filters rows and neighbor references, persists group state, reports visible versus included row counts, and hides full-graph diagrams/cards while any group is disabled. Its call table includes at most 30 rows per group; static summary diagrams return when all groups are restored. |
-| Incremental parity and graph provenance | Implemented for supported indexed sources | `tests/test_cli_export.py::test_incremental_gdscript_edit_preserves_godot_context_and_matches_full_build`, provenance tests in `tests/test_export.py`, `tests/test_watch.py`, and `tests/test_cli_export.py` | Incremental GDScript edits retain unchanged Godot class metadata and match normalized forced-full topology in the fixture. Export metadata separates analyzer package/source version/revision/dirty state from target project revision/dirty state. This does not yet prove every Godot rename, deletion, attachment or cache invalidation case. |
+| Incremental parity and graph provenance | Implemented for covered project, scene, UID, and script changes | `tests/test_cli_export.py::test_incremental_godot_scene_autoload_uid_rename_and_delete_match_full_build`, `test_incremental_gdscript_edit_preserves_godot_context_and_matches_full_build`, provenance tests in `tests/test_export.py`, `tests/test_watch.py`, and `tests/test_cli_export.py` | Raw and clustered CLI fixtures compare incremental results with forced-full topology after autoload replacement, inherited scene attachment override, UID target rename, and UID target deletion. Deletion refresh reports a newly unresolved UID on an unchanged caller. Export metadata separates analyzer package/source version/revision/dirty state from target project revision/dirty state. This remains bounded fixture coverage, not every Godot runtime override. |
+
+## Declared environment
+
+- **Project format:** Godot 4 text projects. Extraction is static and does not
+  launch the editor or validate runtime behavior against a particular engine
+  minor version.
+- **Python:** 3.10 and newer. The pinned GDScript grammar is
+  `tree-sitter-gdscript==6.1.0`, installed with `graphifyy[godot]`.
+- **Full test CI:** Linux with all extras on Python 3.10, 3.12, 3.13 and 3.14.
+- **Clean Godot package CI:** wheel and sdist installs with the Godot extra on
+  Linux and Windows, Python 3.10 and 3.12. A separate Linux/Python 3.12 lane
+  checks the actionable missing-extra message.
+
+Install GDScript support with:
+
+```sh
+python -m pip install "graphifyy[godot]"
+```
 
 ## Source-group rules
 
@@ -48,14 +66,17 @@ matching. The CLI help also documents this variable.
 ## Verification status
 
 The Windows development environment has Tree-sitter 0.25.2 and the
-`tree-sitter-gdscript` 6.1.0 grammar installed. The B6 focused regression set
-passed 81 tests across export/provenance, incremental parity, timing, worker
-selection and watch topology comparison. The complete fork suite and clean
-Windows/Linux package-install gates are being rerun for R1; older full-suite
-results are not final release evidence. The Tiny Demons timing sample and its
-limits are documented in `BENCHMARKS.md`. Reviewed representative query answers,
-the full rename/delete matrix, and clean supported-platform installs remain R1
-gates. Rerun the focused tests with:
+`tree-sitter-gdscript` 6.1.0 grammar installed. Its final local full-suite run
+reported **6,790 passed, 409 skipped, 60 failed, 1,718 warnings** in 993.99
+seconds. The 60 failures match the recorded baseline categories: missing
+`sh`/Git Bash for shell tests, missing local `build`, Terraform and PyYAML
+extras, and tests that hard-code `/tmp` (which resolves to unwritable `G:\tmp`
+on this machine). No GDScript, Godot resolver, or CLI export tests failed. The
+workflow runs the all-extras suite on Linux and clean wheel/sdist Godot-extra
+installs on Linux and Windows; check that workflow on the release commit for
+the supported-platform results. The Tiny Demons timing sample and its limits
+are documented in `BENCHMARKS.md`. Reviewed representative query answers are
+recorded in the Tiny Demons completion plan. Rerun the focused tests with:
 
 ```powershell
 .venv\Scripts\python.exe -m pytest tests/test_gdscript.py tests/test_godot_text.py tests/test_export.py -q
@@ -74,7 +95,8 @@ generated outputs are not source files and should remain ignored.
 
 ## Version policy
 
-The fork is on `v8` and currently retains upstream package version `0.9.86`.
+The fork is on `v8` and uses package version `0.9.87` for its Godot support
+release.
 Do not bump Tiny Demons' game version for Graphify-only tooling changes. Bump
 the fork package version and lockfile when a Graphify for Godot release is cut,
 after the R1 clean-install and platform gates pass. This implementation slice

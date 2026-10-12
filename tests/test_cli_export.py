@@ -515,6 +515,162 @@ def test_incremental_gdscript_edit_retains_unchanged_global_class_links(tmp_path
     assert _canonical_topology_for_compare(incremental) == _canonical_topology_for_compare(full)
 
 
+@pytest.mark.parametrize("no_cluster", [True, False], ids=["raw", "clustered"])
+def test_incremental_godot_scene_autoload_uid_rename_and_delete_match_full_build(tmp_path, no_cluster):
+    """CLI refreshes must replace project/scene/UID facts and evict deleted targets."""
+    pytest.importorskip("tree_sitter_gdscript")
+    project = tmp_path / "godot-project"
+    project.mkdir()
+    (project / "project.godot").write_text(
+        "config_version=5\n"
+        "[application]\n"
+        'run/main_scene="res://derived.tscn"\n'
+        "[autoload]\n"
+        'GameState="*res://autoload_old.gd"\n',
+        encoding="utf-8",
+    )
+    (project / "autoload_old.gd").write_text(
+        "class_name OldGameState\nextends Node\nfunc reset() -> void: pass\n",
+        encoding="utf-8",
+    )
+    (project / "autoload_new.gd").write_text(
+        "class_name NewGameState\nextends Node\nfunc reset() -> void: pass\n",
+        encoding="utf-8",
+    )
+    (project / "base_child.gd").write_text(
+        "class_name BaseChild\nfunc ping() -> void: pass\n", encoding="utf-8",
+    )
+    (project / "override_child.gd").write_text(
+        "class_name OverrideChild\nfunc ping() -> void: pass\n", encoding="utf-8",
+    )
+    (project / "target.gd").write_text(
+        "class_name UIDTarget\nstatic func ping() -> void: pass\n", encoding="utf-8",
+    )
+    (project / "target.gd.uid").write_text("uid://target_old\n", encoding="utf-8")
+    caller = project / "derived_caller.gd"
+    caller.write_text(
+        "class_name DerivedCaller\n"
+        "extends Node\n"
+        'const TARGET = preload("uid://target_old")\n'
+        'const PATH_TARGET = preload("res://target.gd")\n'
+        "func use_child() -> void:\n"
+        '    var child = get_node("Child")\n'
+        "    child.ping()\n"
+        "func use_uid() -> void:\n"
+        "    TARGET.ping()\n"
+        "func use_path() -> void:\n"
+        "    PATH_TARGET.ping()\n",
+        encoding="utf-8",
+    )
+    (project / "base.tscn").write_text(
+        '[gd_scene load_steps=2 format=3]\n'
+        '[ext_resource type="Script" path="res://base_child.gd" id="base"]\n'
+        '[node name="Root" type="Node"]\n'
+        '[node name="Child" type="Node" parent="."]\n'
+        'script = ExtResource("base")\n',
+        encoding="utf-8",
+    )
+    derived_scene = project / "derived.tscn"
+    derived_scene.write_text(
+        '[gd_scene load_steps=4 format=3]\n'
+        '[ext_resource type="PackedScene" path="res://base.tscn" id="base_scene"]\n'
+        '[ext_resource type="Script" path="res://override_child.gd" id="override"]\n'
+        '[ext_resource type="Script" path="res://derived_caller.gd" id="caller"]\n'
+        '[node name="Root" instance=ExtResource("base_scene")]\n'
+        'script = ExtResource("caller")\n'
+        '[node name="Child" parent="." type="Node"]\n'
+        'script = ExtResource("override")\n',
+        encoding="utf-8",
+    )
+
+    def graph_at(path: Path) -> dict:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def run_incremental() -> dict:
+        args = ["extract", ".", "--code-only"]
+        if no_cluster:
+            args.append("--no-cluster")
+        result = _run(args, project)
+        assert result.returncode == 0, result.stderr
+        return graph_at(project / "graphify-out" / "graph.json")
+
+    def assert_matches_full(incremental: dict, label: str) -> dict:
+        full_out = tmp_path / f"full-{label}"
+        args = ["extract", ".", "--code-only", "--force", "--out", str(full_out)]
+        if no_cluster:
+            args.append("--no-cluster")
+        result = _run(
+            args,
+            project,
+        )
+        assert result.returncode == 0, result.stderr
+        full = graph_at(full_out / "graphify-out" / "graph.json")
+        from graphify.watch import _canonical_topology_for_compare
+        assert _canonical_topology_for_compare(incremental) == _canonical_topology_for_compare(full)
+        return full
+
+    def target_paths(graph: dict, context: str) -> set[str]:
+        nodes = {node["id"]: node for node in graph.get("nodes", [])}
+        edges = graph.get("edges", graph.get("links", []))
+        return {
+            str(nodes.get(edge.get("target"), {}).get("source_file") or "")
+            for edge in edges if edge.get("context") == context
+        }
+
+    first = run_incremental()
+    assert "autoload_old.gd" in target_paths(first, "godot_project_autoload")
+    assert "override_child.gd" in target_paths(first, "godot_scene_attached_call")
+    assert "target.gd" in target_paths(first, "godot_script_preload")
+
+    (project / "project.godot").write_text(
+        (project / "project.godot").read_text(encoding="utf-8").replace(
+            "autoload_old.gd", "autoload_new.gd",
+        ),
+        encoding="utf-8",
+    )
+    derived_scene.write_text(
+        derived_scene.read_text(encoding="utf-8").replace(
+            "override_child.gd", "final_override.gd",
+        ),
+        encoding="utf-8",
+    )
+    (project / "override_child.gd").unlink()
+    (project / "final_override.gd").write_text(
+        "class_name FinalOverride\nfunc ping() -> void: pass\n", encoding="utf-8",
+    )
+    (project / "target.gd").rename(project / "renamed_target.gd")
+    (project / "target.gd.uid").rename(project / "renamed_target.gd.uid")
+    (project / "renamed_target.gd.uid").write_text("uid://target_new\n", encoding="utf-8")
+    caller.write_text(
+        caller.read_text(encoding="utf-8")
+        .replace("uid://target_old", "uid://target_new")
+        .replace("res://target.gd", "res://renamed_target.gd"),
+        encoding="utf-8",
+    )
+    second = run_incremental()
+    assert "autoload_old.gd" not in target_paths(second, "godot_project_autoload")
+    assert "autoload_new.gd" in target_paths(second, "godot_project_autoload")
+    assert "override_child.gd" not in target_paths(second, "godot_scene_attached_call")
+    assert "final_override.gd" in target_paths(second, "godot_scene_attached_call")
+    assert "target.gd" not in target_paths(second, "godot_script_preload")
+    assert "renamed_target.gd" in target_paths(second, "godot_script_preload")
+    assert_matches_full(second, "renamed")
+
+    (project / "renamed_target.gd").unlink()
+    (project / "renamed_target.gd.uid").unlink()
+    third = run_incremental()
+    assert "renamed_target.gd" not in target_paths(third, "godot_script_preload")
+    caller_node = next(
+        node for node in third["nodes"]
+        if node.get("source_file") == "derived_caller.gd"
+        and (node.get("metadata") or {}).get("godot_kind") == "file"
+    )
+    diagnostics = caller_node["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any("target_new" in diagnostic.get("message", "") for diagnostic in diagnostics)
+    assert any("renamed_target.gd" in diagnostic.get("message", "") for diagnostic in diagnostics)
+    assert_matches_full(third, "deleted")
+
+
 # Regression test for #934 - cluster-only crashes when graphify-out/ doesn't exist
 
 def test_cluster_only_creates_output_dir_when_missing(tmp_path):

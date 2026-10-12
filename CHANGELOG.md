@@ -2,6 +2,25 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.87 (2026-10-12)
+
+Godot static-project support and source-group navigation release in the
+`Whynchu/graphify-godot` community fork.
+
+- Feature: expanded GDScript declarations, scoped calls, typed receiver and
+  property relationships, resource loads, signals/Callables, project settings,
+  and bounded nested/inherited scene resolution with explicit diagnostics.
+- Feature: Docs, Tests, Scripts, Scenes, Resources, Tools, Addons, Config, and
+  Other filters work across graph, tree, and callflow HTML exports.
+- Fix: incremental Godot updates refresh unchanged caller diagnostics after
+  target deletion and preserve normalized raw/clustered parity for project,
+  scene override, path, and UID changes.
+- Tools: add repeatable update/query/export timing and process-tree memory
+  measurements, analyzer/target provenance, and clean wheel/sdist CI installs
+  with the Godot extra on Windows and Linux.
+- Docs: publish the Godot support matrix, static-analysis limits, and verified
+  Tiny Demons query review. No Tiny Demons game version change is required.
+
 ## 0.9.86 (2026-10-11)
 
 Eighteen community pull requests: language-extraction fixes, safety and determinism hardening, and CLI/query ergonomics.

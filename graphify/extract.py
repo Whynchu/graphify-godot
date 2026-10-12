@@ -8966,12 +8966,44 @@ def extract(
     # `_callable_class` markers), and — together with resolution_context_edges —
     # the member-call resolvers run by run_language_resolvers (#2437).
     resolution_nodes = all_nodes
+    context_godot_diagnostics: dict[str, list[dict]] = {}
+    godot_resolver_active = any(
+        path.suffix.lower() in {".gd", ".tres", ".tscn", ".godot"}
+        for path in paths
+    )
     if resolution_context_nodes:
         _fresh_ids = {n["id"] for n in all_nodes}
-        resolution_nodes = all_nodes + [
-            n for n in resolution_context_nodes
-            if n.get("id") and n["id"] not in _fresh_ids
-        ]
+        _context_copies: list[dict] = []
+        for _context_node in resolution_context_nodes:
+            if not _context_node.get("id") or _context_node["id"] in _fresh_ids:
+                continue
+            # Godot's resolver recomputes diagnostics against the current target
+            # index. Give it a private metadata copy so unchanged context remains
+            # read-only to callers while allowing us to return diagnostic deltas.
+            _context_copy = dict(_context_node)
+            _context_metadata = _context_node.get("metadata")
+            if isinstance(_context_metadata, dict):
+                _context_metadata_copy = dict(_context_metadata)
+                _context_script = _context_metadata.get("godot_script")
+                if isinstance(_context_script, dict):
+                    _context_script_copy = dict(_context_script)
+                    _previous_diagnostics = _context_script.get("resolution_diagnostics")
+                    if (
+                        godot_resolver_active
+                        and _context_metadata.get("godot_kind") == "file"
+                    ):
+                        context_godot_diagnostics[str(_context_node["id"])] = (
+                            list(_previous_diagnostics)
+                            if isinstance(_previous_diagnostics, list) else []
+                        )
+                        # Diagnostics describe the current project graph. Clear
+                        # persisted values before resolving so removed errors do
+                        # not linger after a UID/path target becomes available.
+                        _context_script_copy["resolution_diagnostics"] = []
+                    _context_metadata_copy["godot_script"] = _context_script_copy
+                _context_copy["metadata"] = _context_metadata_copy
+            _context_copies.append(_context_copy)
+        resolution_nodes = all_nodes + _context_copies
     for n in resolution_nodes:
         if n.get("file_type") == "rationale" or n.get("type") == "namespace":
             continue
@@ -9414,11 +9446,37 @@ def extract(
     # results: raw_calls come solely from `paths`, so nothing sourced by an
     # unchanged file is ever emitted, and the ambiguity guards count the same
     # candidates a full build would (the context is the whole unchanged corpus).
+    context_metadata_updates: list[dict] = []
     if resolution_context_nodes or resolution_context_edges:
         _rl_nodes = list(resolution_nodes)
         _rl_edges = all_edges + list(resolution_context_edges or [])
         _n0, _e0 = len(_rl_nodes), len(_rl_edges)
         _run_language_resolvers(paths, per_file, _rl_nodes, _rl_edges)
+        if context_godot_diagnostics:
+            for _context_node in _rl_nodes:
+                _context_id = str(_context_node.get("id") or "")
+                if _context_id not in context_godot_diagnostics:
+                    continue
+                _metadata = _context_node.get("metadata")
+                _script_metadata = (
+                    _metadata.get("godot_script")
+                    if isinstance(_metadata, dict) else None
+                )
+                _current_diagnostics = (
+                    _script_metadata.get("resolution_diagnostics", [])
+                    if isinstance(_script_metadata, dict) else []
+                )
+                if not isinstance(_current_diagnostics, list):
+                    _current_diagnostics = []
+                if context_godot_diagnostics[_context_id] != _current_diagnostics:
+                    context_metadata_updates.append({
+                        "id": _context_id,
+                        "metadata": {
+                            "godot_script": {
+                                "resolution_diagnostics": _current_diagnostics,
+                            },
+                        },
+                    })
         all_nodes.extend(_rl_nodes[_n0:])
         all_edges.extend(_rl_edges[_e0:])
     else:
@@ -9634,6 +9692,10 @@ def extract(
         # merge_raw_extraction know which files were genuinely re-extracted
         # rather than guessing ownership from node["source_file"] (#3411).
         "extracted_sources": [str(p) for p in paths],
+        # Updated resolver diagnostics for unchanged Godot file nodes. The CLI
+        # applies these narrow metadata deltas to the merged graph so deleting
+        # or renaming a resource cannot leave callers silently unresolved.
+        "node_metadata_updates": context_metadata_updates,
     }
 
 
@@ -9642,7 +9704,11 @@ def extract(
 # raw extraction as graph.json (--no-cluster) must leave them out: they put the
 # checkout path and OS username into the graph, and differ between the first
 # build and a rebuild of the same tree.
-RUN_ONLY_EXTRACTION_KEYS = frozenset({"extracted_sources", "failed_sources"})
+RUN_ONLY_EXTRACTION_KEYS = frozenset({
+    "extracted_sources",
+    "failed_sources",
+    "node_metadata_updates",
+})
 
 
 def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None) -> list[Path]:
