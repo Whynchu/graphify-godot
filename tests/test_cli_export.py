@@ -447,6 +447,72 @@ def test_update_no_cluster_writes_raw_graph(tmp_path):
     data = json.loads(graph_path.read_text(encoding="utf-8"))
     assert "nodes" in data and "links" in data
     assert all("community" not in node for node in data["nodes"])
+    assert data["graph"]["analyzer"]["package"] == "graphifyy"
+    assert "version" in data["graph"]["analyzer"]
+    assert data["graph"]["target"] == {"revision": None, "dirty": None}
+
+
+def test_incremental_gdscript_edit_retains_unchanged_global_class_links(tmp_path):
+    """CLI context must retain Godot class metadata when only one script changes."""
+    pytest.importorskip("tree_sitter_gdscript")
+    project = tmp_path / "godot-project"
+    project.mkdir()
+    (project / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    (project / "registry.gd").write_text(
+        "class_name MCPToolkitCommandRegistry\n"
+        "extends RefCounted\n"
+        "func add(_key: String) -> void:\n\tpass\n",
+        encoding="utf-8",
+    )
+    (project / "undo_action.gd").write_text(
+        "class_name MCPToolkitUndoRedoAction\n"
+        "extends RefCounted\n"
+        "static func begin(_description: String) -> MCPToolkitUndoRedoAction:\n"
+        "\treturn MCPToolkitUndoRedoAction.new()\n",
+        encoding="utf-8",
+    )
+    caller = project / "caller.gd"
+    caller.write_text(
+        "class_name Caller\n"
+        "extends RefCounted\n"
+        "static func register(registry: MCPToolkitCommandRegistry) -> void:\n"
+        "\tregistry.add('example')\n"
+        "static func start_action() -> void:\n"
+        "\tMCPToolkitUndoRedoAction.begin('example')\n",
+        encoding="utf-8",
+    )
+
+    first = _run(["extract", ".", "--code-only", "--no-cluster"], project)
+    assert first.returncode == 0, first.stderr
+    caller.write_text(caller.read_text(encoding="utf-8") + "\n# incremental edit\n", encoding="utf-8")
+    incremental_run = _run(["extract", ".", "--code-only", "--no-cluster"], project)
+    assert incremental_run.returncode == 0, incremental_run.stderr
+
+    full_out = tmp_path / "full-output"
+    full_run = _run(
+        ["extract", ".", "--code-only", "--no-cluster", "--force", "--out", str(full_out)],
+        project,
+    )
+    assert full_run.returncode == 0, full_run.stderr
+
+    incremental = json.loads((project / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    full = json.loads((full_out / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    caller_edges = [
+        edge for edge in incremental.get("links", incremental.get("edges", []))
+        if edge.get("source_file") == "caller.gd"
+    ]
+    assert any(
+        edge.get("context") == "godot_global_class_reference"
+        and (edge.get("metadata") or {}).get("godot_global_class") == "MCPToolkitCommandRegistry"
+        for edge in caller_edges
+    )
+    assert any(
+        edge.get("context") == "godot_global_class_reference"
+        and (edge.get("metadata") or {}).get("godot_global_class") == "MCPToolkitUndoRedoAction"
+        for edge in caller_edges
+    )
+    from graphify.watch import _canonical_topology_for_compare
+    assert _canonical_topology_for_compare(incremental) == _canonical_topology_for_compare(full)
 
 
 # Regression test for #934 - cluster-only crashes when graphify-out/ doesn't exist

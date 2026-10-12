@@ -873,6 +873,8 @@ def test_extract_timing_flag_emits_stage_timings(monkeypatch, tmp_path, capsys):
     assert exc.value.code == 0
     err = capsys.readouterr().err
     assert "[graphify timing] detect:" in err
+    assert "[graphify timing] resolution subset:" in err
+    assert "included in AST extract" in err
     assert "[graphify timing] total:" in err
 
     # without --timing => no timing lines

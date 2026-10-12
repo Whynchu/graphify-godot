@@ -714,6 +714,12 @@ class _StageTimer:
             print(f"[graphify timing] {stage}: {now - self._last:.1f}s", file=sys.stderr)
         self._last = now
 
+    def report(self, stage: str, seconds: float, *, detail: str = "") -> None:
+        """Report a measured substage without changing the main stage clock."""
+        if self.enabled:
+            suffix = f" ({detail})" if detail else ""
+            print(f"[graphify timing] {stage}: {seconds:.1f}s{suffix}", file=sys.stderr)
+
     def total(self) -> None:
         if self.enabled:
             print(f"[graphify timing] total: {self._now() - self.start:.1f}s", file=sys.stderr)
@@ -2424,9 +2430,12 @@ def dispatch_command(cmd: str) -> None:
         # The #479 guard can refuse this write, so it goes before the sidecars —
         # a report and labels describing a clustering graph.json does not contain
         # are worse than no run at all (#2436).
-        if not to_json(G, communities, str(out / "graph.json"),
-                       community_labels=labels, built_at_commit=_commit,
-                       original_links=_raw.get("links") or _raw.get("edges") or []):
+        if not to_json(
+            G, communities, str(out / "graph.json"),
+            community_labels=labels, built_at_commit=_commit,
+            target_root=watch_path,
+            original_links=_raw.get("links") or _raw.get("edges") or [],
+        ):
             if not stale_marker_preexisted:
                 _clear_html_stale_marker()
             print(
@@ -3973,6 +3982,7 @@ def dispatch_command(cmd: str) -> None:
         # AST extraction on code files. Empty code list (docs-only corpus) is
         # the issue #698 case — skip cleanly instead of crashing inside extract().
         ast_result: dict = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
+        ast_timing: dict[str, float] = {}
         if code_files:
             from graphify.extract import extract as _ast_extract
             # Anchor the cache at the output root, not the scanned project:
@@ -3981,6 +3991,8 @@ def dispatch_command(cmd: str) -> None:
             # `root` stays the scanned project so source_file/ids relativize
             # against it; conflating the two basenamed every node (#1941).
             ast_kwargs: dict = {"cache_root": out_root, "root": target}
+            if cli_timing:
+                ast_kwargs["timing"] = ast_timing
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
             # #2437/#2438 (the `graphify update` twin of watch's #2406 fix): an
@@ -4068,9 +4080,18 @@ def dispatch_command(cmd: str) -> None:
                                     "module",
                                     "name",
                                     "arity",
+                                    "verification_manifest",
                                 )
                                 if key in _metadata
                             }
+                            # Godot's cross-file resolver reads serialized facts
+                            # from unchanged project/resource/script nodes. Keep
+                            # those bounded Godot facts in resolver context just
+                            # like the established language-specific markers.
+                            _fwd_metadata.update({
+                                key: value for key, value in _metadata.items()
+                                if key.startswith("godot_")
+                            })
                             if _fwd_metadata:
                                 _ctx_node["metadata"] = _fwd_metadata
                         _ctx_nodes.append(_ctx_node)
@@ -4135,6 +4156,11 @@ def dispatch_command(cmd: str) -> None:
                     sys.exit(1)
                 ast_result = {"nodes": [], "edges": [], "input_tokens": 0, "output_tokens": 0}
                 _extraction_incomplete = True  # the whole AST pass was lost
+        if cli_timing and ast_timing:
+            stages.report(
+                "resolution subset", ast_timing.get("resolution_seconds", 0.0),
+                detail="included in AST extract",
+            )
         stages.mark("AST extract")
 
         # Semantic extraction on docs/papers/images. Check cache first.
@@ -4617,8 +4643,12 @@ def dispatch_command(cmd: str) -> None:
             _invalidate_file_manifest_for_db_graph()
             from graphify.paths import write_json_atomic as _write_json_atomic
             from graphify.extract import RUN_ONLY_EXTRACTION_KEYS as _RUN_ONLY_KEYS
+            from graphify.export import _stamp_graph_provenance
             # merge_raw_extraction above has consumed them; graph.json must not
             # carry this run's absolute input paths.
+            _stamp_graph_provenance(
+                merged, graph_json_path, target_root=Path(target).resolve(),
+            )
             _write_json_atomic(
                 graph_json_path,
                 {k: v for k, v in merged.items() if k not in _RUN_ONLY_KEYS},
@@ -4807,8 +4837,11 @@ def dispatch_command(cmd: str) -> None:
         # cwd-anchoring mistake #2316 fixed for watch/update, surviving in the
         # extract path.
         from graphify.watch import _git_head as _gh_target
-        _wrote = _to_json(G, communities, str(graph_json_path), force=_force_write,
-                          built_at_commit=_gh_target(cwd=Path(target).resolve()))
+        _wrote = _to_json(
+            G, communities, str(graph_json_path), force=_force_write,
+            built_at_commit=_gh_target(cwd=Path(target).resolve()),
+            target_root=Path(target).resolve(),
+        )
         if not _wrote:
             # The shrink guard refused: this partial build is smaller than the
             # existing graph. Exit before writing the manifest/marker below, which

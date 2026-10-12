@@ -7728,6 +7728,26 @@ def _spawn_cannot_reimport_main() -> bool:
     return main_file is None or not os.path.isfile(main_file)
 
 
+def _default_parallel_workers(work_count: int) -> int:
+    """Choose a safe automatic pool size while preserving explicit overrides."""
+    env_raw = os.environ.get("GRAPHIFY_MAX_WORKERS", "").strip()
+    env_cap = None
+    if env_raw:
+        try:
+            value = int(env_raw)
+            if value > 0:
+                env_cap = value
+        except ValueError:
+            pass
+    cpu_cap = env_cap if env_cap is not None else (os.cpu_count() or 4)
+    # Windows spawn workers each load a separate Python/Tree-sitter process.
+    # A small Godot corpus showed the uncapped pool multiplying peak RSS with
+    # no throughput gain; cap the default while keeping explicit overrides.
+    if env_cap is None and sys.platform == "win32":
+        cpu_cap = min(cpu_cap, 8)
+    return min(cpu_cap, work_count)
+
+
 def _extract_parallel(
     uncached_work: list[tuple[int, Path]],
     per_file: list[dict | None],
@@ -7746,22 +7766,7 @@ def _extract_parallel(
     import concurrent.futures
 
     if max_workers is None:
-        # Honour GRAPHIFY_MAX_WORKERS env override; otherwise scale to the
-        # full CPU. The historical `, 8)` cap was a safety bound for laptops
-        # in 2023 — on a 32-thread workstation it costs a 4x slowdown
-        # (issue #792). Capping at len(uncached_work) keeps small jobs
-        # from spawning useless idle workers.
-        env_raw = os.environ.get("GRAPHIFY_MAX_WORKERS", "").strip()
-        env_cap = None
-        if env_raw:
-            try:
-                v = int(env_raw)
-                if v > 0:
-                    env_cap = v
-            except ValueError:
-                pass
-        cpu_cap = env_cap if env_cap is not None else (os.cpu_count() or 4)
-        max_workers = min(cpu_cap, len(uncached_work))
+        max_workers = _default_parallel_workers(len(uncached_work))
 
     # Windows ProcessPoolExecutor hard-caps at 61 workers (CPython limitation
     # tied to WaitForMultipleObjects). Clamp here so every path — auto-compute,
@@ -7920,6 +7925,7 @@ def extract(
     max_workers: int | None = None,
     resolution_context_nodes: list[dict] | None = None,
     resolution_context_edges: list[dict] | None = None,
+    timing: dict[str, float] | None = None,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -7940,8 +7946,9 @@ def extract(
             Anchors ids/source_file only as a fallback when `root` is unset.
         parallel: if True and there are >= _PARALLEL_THRESHOLD uncached files,
             use ProcessPoolExecutor for multi-core extraction.
-        max_workers: max subprocess count. Defaults to cpu_count (or the
-            value of GRAPHIFY_MAX_WORKERS if set), bounded by len(uncached_work).
+        max_workers: max subprocess count. Defaults to cpu_count (capped at 8
+            on Windows) or GRAPHIFY_MAX_WORKERS when set, bounded by the
+            uncached file count. An explicit value overrides the automatic cap.
         resolution_context_nodes: read-only AST nodes from files that are NOT
             being extracted this run (an incremental rebuild's unchanged
             corpus, #2406). They extend the cross-file resolution indexes —
@@ -7966,6 +7973,19 @@ def extract(
     _raise_recursion_limit()
     # Workspace package manifests/globs can change during watch or repeated extraction.
     _WORKSPACE_PACKAGE_CACHE.clear()
+
+    def _run_language_resolvers(*args, **kwargs):
+        if timing is None:
+            return run_language_resolvers(*args, **kwargs)
+        import time as _time
+        started = _time.perf_counter()
+        try:
+            return run_language_resolvers(*args, **kwargs)
+        finally:
+            timing["resolution_seconds"] = (
+                timing.get("resolution_seconds", 0.0)
+                + _time.perf_counter() - started
+            )
     # tsconfig/jsconfig compilerOptions are the same kind of state: keyed by
     # config path with no mtime component, so an edit to `paths` or `baseUrl`
     # was never observed again for the life of the process. `graphify watch`
@@ -8985,7 +9005,7 @@ def extract(
     # (ids are final) but before the import-evidence index just below reads the
     # edges — so genuine imported calls get promoted INFERRED -> EXTRACTED. The
     # tail registry run (run_language_resolvers below) would be too late.
-    run_language_resolvers(
+    _run_language_resolvers(
         paths, per_file, all_nodes, all_edges,
         resolvers=[_KOTLIN_IMPORT_TARGET_RESOLVER],
     )
@@ -9398,11 +9418,11 @@ def extract(
         _rl_nodes = list(resolution_nodes)
         _rl_edges = all_edges + list(resolution_context_edges or [])
         _n0, _e0 = len(_rl_nodes), len(_rl_edges)
-        run_language_resolvers(paths, per_file, _rl_nodes, _rl_edges)
+        _run_language_resolvers(paths, per_file, _rl_nodes, _rl_edges)
         all_nodes.extend(_rl_nodes[_n0:])
         all_edges.extend(_rl_edges[_e0:])
     else:
-        run_language_resolvers(paths, per_file, all_nodes, all_edges)
+        _run_language_resolvers(paths, per_file, all_nodes, all_edges)
 
     # A Rust `use` group keeps one edge per binding; its v8 edge only served the calls above.
     all_edges[:] = [e for e in all_edges if not e.pop("_rust_use_group", False)]

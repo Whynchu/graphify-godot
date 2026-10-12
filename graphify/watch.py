@@ -1323,6 +1323,12 @@ def _node_community_map(graph_data: dict) -> dict[str, int]:
 def _canonical_graph_for_compare(graph_data: dict) -> dict:
     canonical = dict(graph_data)
     canonical.pop("built_at_commit", None)
+    graph_meta = canonical.get("graph")
+    if isinstance(graph_meta, dict):
+        graph_meta = dict(graph_meta)
+        graph_meta.pop("analyzer", None)
+        graph_meta.pop("target", None)
+        canonical["graph"] = graph_meta
     # A missing "directed" key means the same thing as "directed": false
     # everywhere else in the codebase (#2342's --no-cluster path only started
     # writing the key once it began inheriting it from the existing graph).
@@ -1353,6 +1359,8 @@ def _canonical_topology_for_compare(graph_data: dict) -> dict:
         graph_meta = dict(graph_meta)
         graph_meta.pop("schema_version", None)
         graph_meta.pop("graphify_version", None)
+        graph_meta.pop("analyzer", None)
+        graph_meta.pop("target", None)
         canonical["graph"] = graph_meta
 
     nodes = canonical.get("nodes")
@@ -2194,6 +2202,10 @@ def _rebuild_code(
             # attribute-less phantom (#2873). Any other edge without two declared
             # endpoints is dropped, as build_from_json drops it.
             _finalize_raw_graph_endpoints(candidate_graph_data)
+            from graphify.export import _stamp_graph_provenance
+            _stamp_graph_provenance(
+                candidate_graph_data, existing_graph, target_root=watch_root,
+            )
             candidate_graph_text = _json_text(candidate_graph_data)
             same_graph = False
             if existing_graph.exists():
@@ -2397,7 +2409,10 @@ def _rebuild_code(
         report_path = out / "GRAPH_REPORT.md"
         labels_json = json.dumps({str(k): v for k, v in sorted(labels.items())}, ensure_ascii=False, indent=2) + "\n"
         graph_tmp = out / ".graph.tmp.json"
-        json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit, community_labels=labels)
+        json_written = to_json(
+            G, communities, str(graph_tmp), force=True, built_at_commit=commit,
+            target_root=watch_root, community_labels=labels,
+        )
         if not json_written:
             return False
         candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))

@@ -4,7 +4,7 @@ How graphify performs as conversational long-term memory and as a
 code-intelligence layer, measured on an open harness with competing systems run
 under identical conditions (same model, same budgets, same grader).
 
-Last updated: 2026-07-05.
+Last updated: 2026-10-12.
 
 ## Summary
 
@@ -201,3 +201,59 @@ python memory/runner.py --phase 3 --split locomo --n 300 \
 # Code cross-tool (ERPNext)
 python crosstool/run.py --repo erpnext --max-spend <budget>
 ```
+
+## Godot indexing and incremental update benchmark
+
+`tools/benchmark_godot_update.py` measures a cold Graphify build, an unchanged
+update, one-file GDScript/resource/scene edits, report and HTML generation, a
+separate query, and a forced full build. It copies text sources into a temporary
+corpus before editing them, records cache state and stage timings, samples peak
+resident memory across the Graphify process tree, and compares normalized
+incremental and full-build topology. It never edits the supplied corpus.
+
+Run from a checkout with its development environment active and with the
+installed `graphifyy` version matching `pyproject.toml`:
+
+```powershell
+.venv\Scripts\python.exe tools/benchmark_godot_update.py `
+  --corpus .. --file-limit 80 `
+  --result .tools/b6-benchmark.json
+
+# Compare lower worker concurrency on the same deterministic sample.
+$env:GRAPHIFY_MAX_WORKERS = "4"
+.venv\Scripts\python.exe tools/benchmark_godot_update.py `
+  --corpus .. --file-limit 80 `
+  --result .tools/b6-benchmark-4workers.json
+Remove-Item Env:GRAPHIFY_MAX_WORKERS
+```
+
+### Tiny Demons sample, Windows x64, 2026-10-12
+
+This is a local, single-machine measurement, not a cross-platform budget or a
+benchmark of the complete Tiny Demons map. The deterministic 80-file temporary
+sample contained 43 `.gd`, 16 `.tres`, 12 `.tscn`, one `project.godot`, and eight
+other text/configuration files (725,856 bytes total). Five Markdown files were
+present in the source corpus but were not part of semantic code extraction.
+Analyzer package/source version was `0.9.86`; the benchmark verified that they
+matched. Resident-memory figures are sampled process-tree working sets and can
+miss short peaks between samples.
+
+| Operation | Default Windows cap (8 workers) | Explicit 4 workers |
+| --- | ---: | ---: |
+| Cold build | 6.017 s / 457.4 MiB | 5.971 s / 279.0 MiB |
+| Unchanged update | 3.574 s / 144.4 MiB | 3.55–3.80 s / about 140 MiB |
+| One GDScript edit | 3.722 s / 143.0 MiB | included in the incremental range |
+| One `.tres` edit | 3.736 s / 144.6 MiB | included in the incremental range |
+| One `.tscn` edit | 3.691 s / 143.8 MiB | included in the incremental range |
+| Separate report and HTML export | 2.287 s | not rerun for the worker comparison |
+| Separate query | 1.010 s / 63.2 MiB | not rerun for the worker comparison |
+| Forced full build | 5.690 s / 455.1 MiB | not rerun for the worker comparison |
+
+The normalized incremental graph matched the forced full graph at 1,408 nodes
+and 2,386 links in both runs. Four workers had nearly the same throughput and
+used about 39% less peak sampled memory than the default eight-worker cap on
+this sample. Set `GRAPHIFY_MAX_WORKERS` or pass `--max-workers` to choose a
+different concurrency level. The default cap is a general Windows compromise;
+the measurements do not establish an optimum for other machines or full-size
+projects. The machine-local result JSON files are ignored under `.tools/` and
+are not committed.

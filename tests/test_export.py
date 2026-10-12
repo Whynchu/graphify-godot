@@ -199,6 +199,107 @@ def test_to_json_commit_fallback_uses_output_repo_not_cwd(tmp_path, monkeypatch)
     assert json.loads(out.read_text())["built_at_commit"] == target_head
 
 
+def test_to_json_explicit_target_root_beats_nested_output_repo(tmp_path):
+    """A map stored inside another checkout must retain the analyzed repo's identity."""
+    import subprocess
+    import networkx as nx
+
+    def git(cwd, *args):
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=cwd, check=True, capture_output=True,
+        )
+
+    target = tmp_path / "tiny-demons"
+    target.mkdir()
+    (target / ".gitignore").write_text("graphify-godot/\n")
+    (target / "project.godot").write_text("config_version=5\n")
+    git(target, "init")
+    git(target, "add", ".gitignore", "project.godot")
+    git(target, "commit", "-m", "target")
+    target_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=target, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    inner = target / "graphify-godot"
+    inner.mkdir()
+    git(inner, "init")
+    git(inner, "commit", "--allow-empty", "-m", "analyzer fork")
+    inner_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=inner, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    out = inner / ".tools" / "tiny-demons-map" / "graph.json"
+    G = nx.Graph()
+    G.add_node("n1", label="n1")
+
+    assert to_json(G, {0: ["n1"]}, str(out), force=True, target_root=target)
+    data = json.loads(out.read_text())
+    assert data["built_at_commit"] == target_head
+    assert data["graph"]["target"] == {"revision": target_head, "dirty": False}
+    assert data["built_at_commit"] != inner_head
+
+    (target / "project.godot").write_text("config_version=5\n# changed\n")
+    assert to_json(G, {0: ["n1"]}, str(out), force=True, target_root=target)
+    assert json.loads(out.read_text())["graph"]["target"]["dirty"] is True
+
+
+def test_to_json_root_marker_beats_nested_output_repo(tmp_path):
+    """The CLI's root marker makes nested output safe for fallback callers too."""
+    import subprocess
+    import networkx as nx
+
+    def git(cwd, *args):
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=cwd, check=True, capture_output=True,
+        )
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "source.gd").write_text("extends Node\n")
+    git(target, "init")
+    git(target, "add", "source.gd")
+    git(target, "commit", "-m", "target")
+    target_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=target, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    inner = target / "graphify-godot"
+    inner.mkdir()
+    git(inner, "init")
+    git(inner, "commit", "--allow-empty", "-m", "fork")
+    output_dir = inner / ".tools" / "tiny-demons-map"
+    output_dir.mkdir(parents=True)
+    (output_dir / ".graphify_root").write_text(str(target))
+    G = nx.Graph()
+    G.add_node("n1", label="n1")
+
+    out = output_dir / "graph.json"
+    assert to_json(G, {0: ["n1"]}, str(out), force=True)
+    data = json.loads(out.read_text())
+    assert data["built_at_commit"] == target_head
+    assert data["graph"]["target"]["revision"] == target_head
+
+
+def test_analyzer_metadata_matches_active_distribution():
+    from importlib.metadata import version
+    import tomllib
+    from graphify.__main__ import __version__
+    from graphify.export import _analyzer_metadata
+
+    analyzer = _analyzer_metadata()
+    source_version = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+    assert analyzer["package"] == "graphifyy"
+    assert analyzer["version"] == version("graphifyy") == __version__ == source_version
+    assert analyzer["source_version"] == source_version
+    assert analyzer["version_matches_source"] is True
+
+
 def test_to_cypher_creates_file():
     G = make_graph()
     with tempfile.TemporaryDirectory() as tmp:

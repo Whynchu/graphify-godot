@@ -22,6 +22,7 @@ For planned completion gates, see the Tiny Demons
 | Scene/resource files | Partial | `test_resource_parser_keeps_nested_links_and_never_scans_strings`, `test_gdscript_node_paths_unique_names_and_attached_receiver_calls`, `test_inherited_scene_nodes_and_attached_scripts_resolve_for_node_paths`, `test_nested_scene_instances_resolve_node_paths_and_attached_script_calls`, `test_inherited_node_override_replaces_base_script_attachment`, `test_nested_scene_instance_cycles_are_reported_without_recursion`, `test_deep_scene_instance_chain_stops_at_documented_limit` | Reads text `.tres` / `.tscn`, external and subresources, explicit script attachments, nested scene instances, root inherited scenes and node overrides, serialized signals, literal `$Path`, `%UniqueName`, and `get_node()` paths. Instanced node paths retain the host-scene context; cycles are diagnosed and expansion stops at 64 nested scenes. Absolute NodePaths, binary scenes/resources and all Godot override edge cases remain outside the static model. |
 | Dynamic boundary evidence | Partial | `test_dynamic_godot_boundaries_report_reasons_without_guessed_edges` | Reports common computed loads, unresolved `call`/`call_deferred`, group lookups/dispatch, `set_script`, `add_child`, and dynamic signal callbacks. Literal `call()` targets resolve only with a unique supported receiver. This is a bounded inventory, not a complete model of reflection or runtime injection. |
 | Source-group HTML filters | Implemented across graph, tree, and callflow HTML | `tests/test_export.py::test_html_source_groups_classify_paths_and_explicit_overrides`, `test_html_source_and_community_filters_intersect_at_runtime`, `test_html_aggregated_communities_retain_source_group_membership`, `test_html_aggregates_recompute_group_member_and_link_counts`, `tests/test_tree_html.py::test_build_tree_tracks_source_groups_and_grouped_truncation`, `test_tree_filtering_recomputes_visible_symbol_totals`, `tests/test_callflow_html.py::test_callflow_source_group_filters_annotate_rows_and_relationships`, `test_callflow_call_table_keeps_a_bounded_sample_per_source_group`, `test_callflow_source_group_filter_runtime_hides_excluded_rows_and_refs` | Docs, Tests, Scripts, Scenes, Resources, Tools, Addons, Config, and Other use one path/override classifier in all three HTML views. Graph filters intersect with community visibility, search, edge contributions, selection, and URL state. Oversized graph summaries retain per-group node and cross-community edge counts and recompute visible totals; communities remain aggregate nodes without individual-member drilldown. Tree filters symbols, recomputes directory counts and URL state, and attributes per-file truncation summaries to groups. Callflow filters rows and neighbor references, persists group state, reports visible versus included row counts, and hides full-graph diagrams/cards while any group is disabled. Its call table includes at most 30 rows per group; static summary diagrams return when all groups are restored. |
+| Incremental parity and graph provenance | Implemented for supported indexed sources | `tests/test_cli_export.py::test_incremental_gdscript_edit_preserves_godot_context_and_matches_full_build`, provenance tests in `tests/test_export.py`, `tests/test_watch.py`, and `tests/test_cli_export.py` | Incremental GDScript edits retain unchanged Godot class metadata and match normalized forced-full topology in the fixture. Export metadata separates analyzer package/source version/revision/dirty state from target project revision/dirty state. This does not yet prove every Godot rename, deletion, attachment or cache invalidation case. |
 
 ## Source-group rules
 
@@ -46,24 +47,22 @@ matching. The CLI help also documents this variable.
 
 ## Verification status
 
-The Windows development environment currently has Tree-sitter 0.25.2 and the
-`tree-sitter-gdscript` 6.1.0 grammar installed. The changed-area suite passed
-98 tests (9 cache-root-switch warnings from the shared Windows test process).
-The full fork suite, run before the final typed-property and cache-schema
-changes, completed with 6,760 passed, 409 skipped, and 60 failed. The failures
-were in shell-dependent hooks (`sh` is unavailable in this Windows shell),
-optional language/dependency coverage, and Windows path-sensitive tests,
-outside the changed-area suite. Linux clean-install coverage for the Godot extra,
-a full cross-platform release gate,
-broader parser corpus acceptance, and reviewed representative Tiny Demons query
-answers remain release proof work. Rerun the focused tests with:
+The Windows development environment has Tree-sitter 0.25.2 and the
+`tree-sitter-gdscript` 6.1.0 grammar installed. The B6 focused regression set
+passed 81 tests across export/provenance, incremental parity, timing, worker
+selection and watch topology comparison. The complete fork suite and clean
+Windows/Linux package-install gates are being rerun for R1; older full-suite
+results are not final release evidence. The Tiny Demons timing sample and its
+limits are documented in `BENCHMARKS.md`. Reviewed representative query answers,
+the full rename/delete matrix, and clean supported-platform installs remain R1
+gates. Rerun the focused tests with:
 
 ```powershell
 .venv\Scripts\python.exe -m pytest tests/test_gdscript.py tests/test_godot_text.py tests/test_export.py -q
 ```
 
 The 2026-10-11 Tiny Demons corpus sweep parsed all 605 `.gd` files with 0
-grammar-recovery diagnostics. This closes the seven known recovery spans by
+grammar-recovery diagnostics. This closes the seven previously observed recovery spans by
 normalizing compact compound statements while restoring original source lines.
 It does not establish full GDScript grammar support; lambda and other uncovered
 syntax still require dedicated fixtures. The sweep is integration evidence, not
@@ -88,7 +87,5 @@ does not publish a package.
 - Dynamic or computed resource/NodePaths except for bounded diagnostics.
 - A complete callable/member/call graph for reflection, arbitrary signal
   callbacks, group membership, runtime injection, or runtime `set_script()`.
-- Flattening ordinary instanced scenes and all inherited-scene overrides.
-- Source-group filters in Graphify's inventory tree and callflow HTML exports.
 - Treating a missing static read edge as proof that an authored property is
   dead or unused at runtime.

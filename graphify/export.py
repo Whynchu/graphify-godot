@@ -186,6 +186,118 @@ def _graphify_version() -> str | None:
         return None
 
 
+def _git_dirty(cwd: "str | Path | None") -> bool | None:
+    """Return whether the repository at ``cwd`` has tracked or untracked edits."""
+    import subprocess as _sp
+    if cwd is None:
+        return None
+    try:
+        result = _sp.run(
+            ["git", "status", "--porcelain"], cwd=str(cwd), capture_output=True,
+            text=True, timeout=5,
+        )
+        return bool(result.stdout.strip()) if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _analyzer_metadata() -> dict:
+    """Describe the installed analyzer and, for source checkouts, its revision."""
+    import subprocess as _sp
+    from pathlib import Path as _Path
+
+    metadata = {
+        "package": "graphifyy",
+        "version": _graphify_version(),
+        "source_version": None,
+        "version_matches_source": None,
+        "revision": None,
+        "dirty": None,
+    }
+    source_file = _Path(__file__).resolve()
+    try:
+        root_result = _sp.run(
+            ["git", "rev-parse", "--show-toplevel"], cwd=str(source_file.parent),
+            capture_output=True, text=True, timeout=3,
+        )
+        if root_result.returncode != 0:
+            return metadata
+        repo_root = _Path(root_result.stdout.strip()).resolve()
+        relative = source_file.relative_to(repo_root).as_posix()
+        tracked = _sp.run(
+            ["git", "ls-files", "--error-unmatch", "--", relative],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=3,
+        )
+        if tracked.returncode != 0:
+            return metadata
+        pyproject = repo_root / "pyproject.toml"
+        if pyproject.is_file():
+            try:
+                import tomllib as _tomllib
+            except ImportError:  # Python 3.10
+                import tomli as _tomllib
+            project_data = _tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            source_version = project_data.get("project", {}).get("version")
+            if isinstance(source_version, str):
+                metadata["source_version"] = source_version
+                metadata["version_matches_source"] = metadata["version"] == source_version
+        metadata["revision"] = _git_head(repo_root)
+        status = _sp.run(
+            ["git", "status", "--porcelain", "--", "graphify", "pyproject.toml"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=5,
+        )
+        if status.returncode == 0:
+            metadata["dirty"] = bool(status.stdout.strip())
+    except Exception:
+        pass
+    return metadata
+
+
+def _target_root_for_output(
+    output_path: "str | Path", target_root: "str | Path | None" = None,
+) -> "Path":
+    """Find the analyzed checkout without mistaking a nested output repo for it."""
+    from pathlib import Path as _Path
+
+    if target_root is not None:
+        return _Path(target_root).expanduser().resolve()
+    output_dir = _Path(output_path).expanduser().resolve().parent
+    marker = output_dir / ".graphify_root"
+    try:
+        marked_root = _Path(marker.read_text(encoding="utf-8").strip()).expanduser()
+        if marked_root.exists():
+            return marked_root.resolve()
+    except (OSError, ValueError):
+        pass
+    # Preserve the conventional <target>/graphify-out placement as a useful
+    # fallback for direct library callers that have not written a root marker.
+    if output_dir.name == "graphify-out":
+        return output_dir.parent
+    return output_dir
+
+
+def _stamp_graph_provenance(
+    data: dict, output_path: "str | Path", *,
+    target_root: "str | Path | None" = None,
+    built_at_commit: str | None = None,
+) -> None:
+    """Attach analyzer and analyzed-checkout provenance to serialized graph data."""
+    graph_metadata = data.setdefault("graph", {})
+    graph_metadata["schema_version"] = GRAPH_SCHEMA_VERSION
+    version = _graphify_version()
+    if version is not None:
+        graph_metadata["graphify_version"] = version
+    graph_metadata["analyzer"] = _analyzer_metadata()
+    analyzed_root = _target_root_for_output(output_path, target_root)
+    commit = built_at_commit if built_at_commit is not None else _git_head(analyzed_root)
+    graph_metadata["target"] = {
+        "revision": commit,
+        "dirty": _git_dirty(analyzed_root),
+    }
+    if commit:
+        data["built_at_commit"] = commit
+
+
 # Fallback scores for an edge that carries a confidence tier but no
 # confidence_score. The INFERRED default was 0.5, which references/extraction-spec.md
 # rules out in as many words — "never omit it, never use 0.5 as a default" — and
@@ -283,7 +395,7 @@ def existing_graph_node_count(path: "str | Path"):
     return len(nodes) if isinstance(nodes, list) else MALFORMED_GRAPH
 
 
-def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None, original_links: "list[dict] | None" = None) -> bool:
+def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, target_root: "str | Path | None" = None, community_labels: dict[int, str] | None = None, original_links: "list[dict] | None" = None) -> bool:
     # Drop #3774 accounting before any write. Extract pops these first; every
     # other caller of to_json (the documented build_merge persist path) does not.
     from graphify.build import take_shrink_accounting
@@ -447,17 +559,13 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
         data["graph"]["hyperedges"] = hyperedges
     data["hyperedges"] = hyperedges
-    graph_metadata = data.setdefault("graph", {})
-    graph_metadata["schema_version"] = GRAPH_SCHEMA_VERSION
-    graphify_version = _graphify_version()
-    if graphify_version is not None:
-        graph_metadata["graphify_version"] = graphify_version
-    # Fallback provenance comes from the repo the graph is being written INTO
-    # (output_path lives in <target>/graphify-out/), never the shell's cwd —
-    # the same cwd-anchoring mistake #2316 fixed for `update`.
-    commit = built_at_commit if built_at_commit is not None else _git_head(Path(output_path).resolve().parent)
-    if commit:
-        data["built_at_commit"] = commit
+    # Output may live inside a different nested Git repo (for example, a local
+    # Tiny Demons map under graphify-godot/.tools/). Provenance follows the
+    # explicit scan root or .graphify_root marker, never the output directory.
+    _stamp_graph_provenance(
+        data, output_path, target_root=target_root,
+        built_at_commit=built_at_commit,
+    )
     from graphify.paths import write_json_atomic
     # Atomic write: a crash/ENOSPC mid-write must not truncate a good graph.json.
     write_json_atomic(output_path, data, compact=True)

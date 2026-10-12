@@ -3506,6 +3506,22 @@ def test_extract_parallel_skips_pool_when_max_workers_is_one(tmp_path, monkeypat
     assert spawned["count"] == 0, "no pool may be spawned when max_workers resolves to 1"
 
 
+def test_windows_default_worker_cap_preserves_explicit_overrides(monkeypatch):
+    from graphify import extract as extract_mod
+
+    monkeypatch.setattr(extract_mod.os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(extract_mod.sys, "platform", "win32")
+    monkeypatch.delenv("GRAPHIFY_MAX_WORKERS", raising=False)
+    assert extract_mod._default_parallel_workers(80) == 8
+
+    monkeypatch.setenv("GRAPHIFY_MAX_WORKERS", "12")
+    assert extract_mod._default_parallel_workers(80) == 12
+
+    monkeypatch.setattr(extract_mod.sys, "platform", "linux")
+    monkeypatch.delenv("GRAPHIFY_MAX_WORKERS", raising=False)
+    assert extract_mod._default_parallel_workers(80) == 64
+
+
 def test_extract_parallel_still_spawns_pool_for_multiple_workers(tmp_path, monkeypatch):
     """Guard the #2173 skip: >1 worker must still take the pool path."""
     import concurrent.futures

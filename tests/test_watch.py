@@ -15,10 +15,37 @@ from graphify.watch import (
     _check_shrink,
     _batch_triggers_rebuild,
     _batch_needs_llm_flag,
+    _canonical_graph_for_compare,
+    _canonical_topology_for_compare,
 )
 
 
 # --- _notify_only ---
+
+def test_provenance_changes_do_not_count_as_graph_topology_changes():
+    before = {
+        "built_at_commit": "old-target",
+        "graph": {
+            "schema_version": 1,
+            "graphify_version": "0.9.86",
+            "analyzer": {"version": "0.9.86", "revision": "old-analyzer", "dirty": False},
+            "target": {"revision": "old-target", "dirty": False},
+        },
+        "nodes": [],
+        "links": [],
+    }
+    after = {
+        **before,
+        "built_at_commit": "new-target",
+        "graph": {
+            **before["graph"],
+            "analyzer": {"version": "0.9.87", "revision": "new-analyzer", "dirty": True},
+            "target": {"revision": "new-target", "dirty": True},
+        },
+    }
+
+    assert _canonical_graph_for_compare(before) == _canonical_graph_for_compare(after)
+    assert _canonical_topology_for_compare(before) == _canonical_topology_for_compare(after)
 
 def test_notify_only_creates_flag(tmp_path):
     _notify_only(tmp_path)
