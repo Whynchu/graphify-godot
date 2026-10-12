@@ -1,4 +1,6 @@
 import json
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,6 +68,110 @@ def test_write_callflow_html_creates_file_and_uses_report(tmp_path):
     assert "ApiClient" in content
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in content
     assert "<script>alert(1)</script>" not in content
+
+
+def test_callflow_source_group_filters_annotate_rows_and_relationships(tmp_path):
+    out = _make_graphify_out(tmp_path)
+    graph = json.loads((out / "graph.json").read_text(encoding="utf-8"))
+    graph["nodes"][0]["source_file"] = "scripts/api.py"
+    graph["nodes"][1]["source_file"] = "tests/test_main.py"
+    graph["nodes"][2]["source_file"] = "docs/export.md"
+    (out / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    html_path = write_callflow_html(tmp_path, output="graphify-out/filters.html", max_sections=4)
+    content = html_path.read_text(encoding="utf-8")
+
+    assert 'class="source-group-cb"' in content
+    assert 'value="tests" checked' in content
+    assert 'data-source-group="tests"' in content
+    assert 'data-source-group="docs"' in content
+    assert 'data-ref-cell="true"' in content
+    assert 'data-group-counts="' in content
+    assert "body.filtered-source-groups .filter-static" in content
+    assert "No references in selected groups." in content
+    assert "#filters=" in content
+
+
+def test_callflow_call_table_keeps_a_bounded_sample_per_source_group():
+    from graphify.callflow_html import generate_call_table_rows
+
+    nodes = [
+        {"id": f"script-{i}", "label": f"script_{i}", "source_file": "src/module.py", "source_group": "scripts"}
+        for i in range(31)
+    ] + [
+        {"id": f"test-{i}", "label": f"test_{i}", "source_file": "tests/test_module.py", "source_group": "tests"}
+        for i in range(31)
+    ]
+    rows = generate_call_table_rows(nodes, [], "en", all_edges=[], all_nodes=nodes)
+    assert rows.count("<tr data-source-group=") == 60
+    assert rows.count('data-source-group="scripts"') == 30
+    assert rows.count('data-source-group="tests"') == 30
+
+
+def test_callflow_source_group_filter_runtime_hides_excluded_rows_and_refs(tmp_path):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+    out = _make_graphify_out(tmp_path)
+    graph = json.loads((out / "graph.json").read_text(encoding="utf-8"))
+    graph["nodes"][0]["source_file"] = "scripts/api.py"
+    graph["nodes"][1]["source_file"] = "tests/test_main.py"
+    graph["nodes"][2]["source_file"] = "docs/export.md"
+    (out / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    content = write_callflow_html(tmp_path, output="graphify-out/runtime.html", max_sections=4).read_text(encoding="utf-8")
+    match = re.search(r"<script>\s*(\(function \(\) \{\s*const SOURCE_GROUPS = .*?\n\}\)\(\);)\s*</script>", content, re.DOTALL)
+    assert match, "callflow source filter script was not emitted"
+    filter_script = match.group(1)
+    harness = f"""
+const boxes = ['docs','tests','scripts','scenes','resources','tools','addons','config','other'].map(value => ({{
+  value, checked: true, listeners: {{}}, dataset: {{}},
+  addEventListener(name, fn) {{ (this.listeners[name] ||= []).push(fn); }}
+}}));
+const countElements = Object.fromEntries(boxes.map(box => [box.value, {{textContent: ''}}]));
+const makeSection = groups => {{
+  const count = {{textContent: ''}}, tableCount = {{textContent: ''}};
+  const rows = Object.fromEntries(Object.entries(groups).map(([group,value]) => [group,Math.min(30,value)]));
+  const section = {{dataset: {{groupCounts: JSON.stringify(groups),rowCounts:JSON.stringify(rows)}}, hidden: false,
+    querySelector(selector) {{ return selector === '[data-table-count]' ? tableCount : count; }}, count, tableCount}};
+  section.heading = {{closest() {{ return section; }}}};
+  return section;
+}};
+const section = makeSection({{scripts: 1, tests: 1, docs: 1}});
+const scriptRow = {{dataset: {{sourceGroup:'scripts'}}, hidden:false}};
+const testRow = {{dataset: {{sourceGroup:'tests'}}, hidden:false}};
+const refs = [{{dataset:{{sourceGroup:'scripts'}},hidden:false}},{{dataset:{{sourceGroup:'tests'}},hidden:false}}];
+const cell = {{children:[], querySelectorAll(){{return refs;}}, querySelector(){{return this.empty || null;}}, appendChild(el){{this.empty=el;}}}};
+const empty = {{hidden:false}};
+const navOverview = {{hidden:false, getAttribute(){{return '#overview';}}}};
+const navSection = {{hidden:false, getAttribute(){{return '#runtime';}}}};
+const navTarget = {{closest(){{return section;}}}};
+const elements = new Map();
+for (const [id, value] of [['source-filter-count',{{textContent:''}}],['source-select-all',{{listeners:{{}},addEventListener(n,f){{this.listeners[n]=f;}}}}],['source-clear-all',{{listeners:{{}},addEventListener(n,f){{this.listeners[n]=f;}}}}]]) elements.set(id,value);
+const document = {{
+ body: {{classList:{{toggle(name,value){{this[name]=value;}}}}}},
+ querySelectorAll(selector) {{
+   if (selector === '.source-group-cb') return boxes;
+   if (selector === '.callflow-section') return [section];
+   if (selector === '.call-table tr[data-source-group]') return [scriptRow,testRow];
+   if (selector === '[data-ref-cell="true"]') return [cell];
+   if (selector === '.nav a') return [navOverview,navSection];
+   return [];
+ }},
+ querySelector(selector) {{ const m=selector.match(/value="([^"]+)"/); return m ? {{parentElement:{{querySelector(){{return countElements[m[1]];}}}}}} : null; }},
+ getElementById(id) {{ if (id === 'runtime') return navTarget; return elements.get(id) || null; }},
+ createElement() {{ return {{className:'',textContent:'',style:{{}}}}; }}
+}};
+const window = {{location:{{hash:'#filters=%7B%22groups%22%3A%5B%22scripts%22%5D%7D'}},history:{{replaceState(_a,_b,url){{window.location.hash=url.slice(url.indexOf('#'));}}}}}};
+{filter_script}
+const initial = {{testHidden:testRow.hidden, scriptHidden:scriptRow.hidden, testRefHidden:refs[1].hidden, visible:section.count.textContent, note:document.body.classList['filtered-source-groups']}};
+const testBox=boxes.find(box=>box.value==='tests'); testBox.checked=true; testBox.listeners.change[0]();
+console.log(JSON.stringify({{initial, after:{{testHidden:testRow.hidden, testRefHidden:refs[1].hidden, visible:section.count.textContent}},hash:window.location.hash}}));
+"""
+    result = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["initial"] == {"testHidden": True, "scriptHidden": False, "testRefHidden": True, "visible": "(1/3 visible; 1 rows shown)", "note": True}
+    assert state["after"] == {"testHidden": False, "testRefHidden": False, "visible": "(2/3 visible; 2 rows shown)"}
+    assert "#filters=" in state["hash"] and "tests" in state["hash"]
 
 
 def test_export_callflow_html_cli_creates_file(tmp_path):

@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from html import escape
 
 from graphify.paths import GRAPHIFY_OUT, GRAPHIFY_OUT_NAME
+from graphify.source_groups import SOURCE_GROUPS, source_group_for_node
 
 
 # ──────────────────────────────────────────────
@@ -45,6 +46,18 @@ CSS = """:root {
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; }
 .container { max-width: 1200px; margin: 0 auto; padding: 40px 24px; }
+.source-filter-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin: 20px 0; }
+.source-filter-wrap h2 { font-size: 1.1rem; margin: 0 0 8px; padding: 0; border: 0; }
+.source-groups { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.source-group-item { white-space: nowrap; }
+.source-filter-wrap button { margin: 8px 8px 0 0; padding: 5px 10px; background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 5px; cursor: pointer; }
+.source-group-count, .section-visible-count { color: var(--muted); font-size: 0.82rem; }
+.source-filter-note { display: none; padding: 10px 12px; border-left: 3px solid var(--warn); background: rgba(251,191,36,0.08); color: var(--text); }
+body.filtered-source-groups .source-filter-note { display: block; }
+body.filtered-source-groups .filter-static { display: none !important; }
+.callflow-section[hidden], .nav a[hidden], .source-ref[hidden] { display: none !important; }
+.filtered-ref-empty { display: none; color: var(--muted); font-style: italic; }
+.call-table-limit { font-size: 0.82rem; }
 h1 { font-size: 2.4rem; margin-bottom: 8px; background: linear-gradient(135deg, var(--accent), #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 h2 { font-size: 1.7rem; margin: 48px 0 16px; padding-bottom: 8px; border-bottom: 2px solid var(--accent); }
 h3 { font-size: 1.25rem; margin: 32px 0 12px; color: var(--accent); }
@@ -1199,20 +1212,25 @@ def node_display_name(node: dict | None, fallback: str = "") -> str:
 
 
 def format_node_refs(node_ids: set, node_by_id: dict, lang: str, empty_text: str, limit: int = 3) -> str:
-    """Render node references as readable labels instead of internal IDs."""
+    """Render readable node references with their source-group ownership."""
     if not node_ids:
-        return escape(empty_text)
+        return f'<span class="source-ref-empty">{escape(empty_text)}</span>'
+    grouped = defaultdict(list)
+    for nid in node_ids:
+        grouped[source_group_for_node(node_by_id.get(nid) or {})].append(nid)
     parts = []
-    for nid in sorted(node_ids, key=lambda item: node_display_name(node_by_id.get(item), item).lower())[:limit]:
-        node = node_by_id.get(nid)
-        label = node_display_name(node, nid)
-        source = safe_file_path((node or {}).get("source_file", ""))
-        if source:
-            parts.append(f"<code>{escape(label)}</code><br><small style=\"color:var(--muted)\">{escape(source)}</small>")
-        else:
-            parts.append(f"<code>{escape(label)}</code>")
-    if len(node_ids) > limit:
-        parts.append(escape(pick_text(lang, f"+{len(node_ids) - limit} 个更多", f"+{len(node_ids) - limit} more")))
+    for group_id, _label in SOURCE_GROUPS:
+        refs = sorted(grouped.get(group_id, []), key=lambda item: node_display_name(node_by_id.get(item), item).lower())
+        for nid in refs[:limit]:
+            node = node_by_id.get(nid)
+            label = node_display_name(node, nid)
+            source = safe_file_path((node or {}).get("source_file", ""))
+            detail = f"<code>{escape(label)}</code><br><small style=\"color:var(--muted)\">{escape(source)}</small>" if source else f"<code>{escape(label)}</code>"
+            parts.append(f'<span class="source-ref" data-source-group="{group_id}">{detail}</span>')
+        if len(refs) > limit:
+            count = len(refs) - limit
+            more = escape(pick_text(lang, f"+{count} more", f"+{count} more"))
+            parts.append(f'<span class="source-ref" data-source-group="{group_id}">{more}</span>')
     return "<br>".join(parts)
 
 
@@ -1252,11 +1270,18 @@ def generate_call_table_rows(
             callees[src].add(tgt)
 
     rows = []
-    for i, n in enumerate(nodes[:30], 1):  # cap at 30 rows
+    rows_by_group = defaultdict(list)
+    for node in nodes:
+        rows_by_group[source_group_for_node(node)].append(node)
+    ordered_nodes = []
+    for group_id, _label in SOURCE_GROUPS:
+        ordered_nodes.extend(rows_by_group.get(group_id, [])[:30])
+    for i, n in enumerate(ordered_nodes, 1):  # cap at 30 rows per source group
         nid = n.get("id", "")
         label = n.get("label", nid)
         source_file = safe_file_path(n.get("source_file", ""))
         file_type = n.get("file_type", "code")
+        group_id = source_group_for_node(n)
 
         # Suggest a tag type based on file_type and label heuristics
         tag = _suggest_tag(label, file_type, lang, node_kind(n))
@@ -1274,12 +1299,12 @@ def generate_call_table_rows(
             pick_text(lang, "无直接出边", "No direct outbound edge"),
         )
 
-        rows.append(f"""<tr>
+        rows.append(f"""<tr data-source-group="{group_id}">
   <td>{i}</td>
   <td><code>{escape(label)}</code><br><small style="color:var(--muted)">{escape(source_file)}</small></td>
   <td>{tag}</td>
-  <td>{caller_text}</td>
-  <td>{callee_text}</td>
+  <td data-ref-cell="true">{caller_text}</td>
+  <td data-ref-cell="true">{callee_text}</td>
   <td>{escape(_describe_node(label, source_file, file_type, lang))}</td>
 </tr>""")
 
@@ -1646,6 +1671,15 @@ def write_callflow_html(
 
     # Load data
     nodes, edges, hyperedges, meta = load_graph(paths["graph"])
+    for node in nodes:
+        node["source_group"] = source_group_for_node(node)
+    source_group_counts = Counter(node["source_group"] for node in nodes)
+    source_groups_json = json.dumps(
+        [{"id": group_id, "label": label, "count": source_group_counts.get(group_id, 0)}
+         for group_id, label in SOURCE_GROUPS],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).replace("<", "\\u003c")
     labels = load_labels(paths["labels"])
     lang = detect_lang(args.lang, nodes, labels)
     if paths["sections"]:
@@ -1716,9 +1750,23 @@ def write_callflow_html(
 
     # Header + nav
     html.append(generate_header(sections, meta, lang))
+    source_group_items = "\n".join(
+        f'<label class="source-group-item"><input class="source-group-cb" type="checkbox" value="{group_id}" checked aria-label="Show {label} source group"> {label} <span class="source-group-count">{source_group_counts.get(group_id, 0)}</span></label>'
+        for group_id, label in SOURCE_GROUPS
+    )
+    html.append(f"""<section id="source-filter-wrap" class="source-filter-wrap" aria-label="Source group filters">
+<h2>Source groups</h2>
+<div class="source-groups">{source_group_items}</div>
+<button type="button" id="source-select-all">Select all</button>
+<button type="button" id="source-clear-all">Clear all</button>
+<p id="source-filter-count" aria-live="polite"></p>
+</section>
+<p id="source-filter-note" class="source-filter-note">Filtered source groups show exact node rows and references. Architecture diagrams, relationship summaries, hyperedges, and static statistics are hidden while filters are active because they summarize the full graph.</p>
+""")
 
     # ── Architecture Overview (Section "overview") ──
     overview_name = sections[0].get("name", "Architecture Overview") if sections else "Architecture Overview"
+    html.append('<div id="overview-static" class="filter-static">')
     html.append(f"""<!-- ====== Architecture Overview ====== -->
 <h2 id="overview">1. {escape(str(overview_name))}</h2>
 
@@ -1731,6 +1779,7 @@ def write_callflow_html(
     report_card = _report_highlights(report_text, lang)
     if report_card:
         html.append(f'<div class="grid">\n  {report_card}\n</div>')
+    html.append("</div><!-- #overview-static -->")
     html.append("<hr>")
 
     # ── Per-section content ──
@@ -1743,6 +1792,10 @@ def write_callflow_html(
         name = sec.get("name", sid)
         sec_nodes = section_nodes_map.get(sid, [])
         sec_edges = classified.get("intra", {}).get(sid, [])
+        section_group_counts = Counter(node["source_group"] for node in sec_nodes)
+        group_counts_attr = escape(json.dumps(section_group_counts, separators=(",", ":")), quote=True)
+        section_row_counts = {group: min(count, 30) for group, count in section_group_counts.items()}
+        row_counts_attr = escape(json.dumps(section_row_counts, separators=(",", ":")), quote=True)
 
         edge_count = len(sec_edges)
         h3_title = pick_text(lang, "调用明细", "Call Details")
@@ -1754,11 +1807,14 @@ def write_callflow_html(
         desc_header = pick_text(lang, "说明", "Description")
 
         html.append(f"""<!-- ====== {section_num}. {html_comment_text(name)} ====== -->
-<h2 id="{escape(str(sid), quote=True)}">{section_num}. {escape(str(name))}</h2>
+<section class="callflow-section" id="callflow-section-{escape(str(sid), quote=True)}" data-group-counts="{group_counts_attr}" data-row-counts="{row_counts_attr}">
+<h2 id="{escape(str(sid), quote=True)}">{section_num}. {escape(str(name))} <small class="section-visible-count" data-section-count="true"></small></h2>
+<div class="filter-static">
 {generate_section_intro(sec, sec_nodes, edge_count, lang)}
 
 <div class="mermaid">
 {generate_section_flowchart(sid, name, sec_nodes, sec_edges, lang, args.diagram_scale, args.max_diagram_nodes, args.max_diagram_edges)}
+</div>
 </div>
 
 <h3>{h3_title}</h3>
@@ -1773,13 +1829,18 @@ def write_callflow_html(
 </tr>
 {generate_call_table_rows(sec_nodes, sec_edges, lang, edges, nodes)}
 </table>
+<p class="call-table-limit" data-table-count="true"></p>
 
+<div class="filter-static">
 {generate_section_cards(sec, sec_nodes, sec_edges, lang)}
-<hr>
+</div>
+</section>
+<hr class="filter-static">
 """)
 
     # ── Section: Hyperedges (if any) ──
     if hyperedges:
+        html.append('<div class="filter-static" id="hyperedges-static">')
         html.append("""<h2 id="hyperedges">Group Relationships (Hyperedges)</h2>
 <div class="grid">
 """)
@@ -1797,11 +1858,12 @@ def write_callflow_html(
             if len(hnodes) > 5:
                 html.append(f"      <li>... and {len(hnodes) - 5} more</li>")
             html.append("    </ul>\n  </div>")
-        html.append("</div>\n<hr>")
+        html.append("</div>\n<hr></div><!-- #hyperedges-static -->")
 
     # ── Section: Statistics ──
     total_sections = sum(1 for s in sections if s["id"] != "overview")
-    html.append(f"""<h2 id="stats">Project Statistics</h2>
+    html.append(f"""<div class="filter-static" id="stats-static">
+<h2 id="stats">Project Statistics</h2>
 
 <div class="grid">
   <div class="card">
@@ -1823,6 +1885,7 @@ def write_callflow_html(
     </table>
   </div>
 </div>
+ </div><!-- #stats-static -->
 """)
 
     # ── Footer ──
@@ -1834,6 +1897,96 @@ def write_callflow_html(
 
     # Close
     html.append("""</div><!-- .container -->
+
+<script>
+(function () {
+  const SOURCE_GROUPS = {source_groups_json};
+  const knownGroups = new Set(SOURCE_GROUPS.map(group => group.id));
+  const selectedGroups = new Set(knownGroups);
+  if (window.location.hash.startsWith('#filters=')) {
+    try {
+      const state = JSON.parse(decodeURIComponent(window.location.hash.slice(9)));
+      if (Array.isArray(state.groups)) {
+        selectedGroups.clear();
+        state.groups.forEach(group => { if (knownGroups.has(group)) selectedGroups.add(group); });
+      }
+    } catch (_error) { /* Invalid shared state keeps all groups selected. */ }
+  }
+
+  const checkboxes = [...document.querySelectorAll('.source-group-cb')];
+  function applyFilters(persist = true) {
+    const filtered = selectedGroups.size !== knownGroups.size;
+    document.body.classList.toggle('filtered-source-groups', filtered);
+    checkboxes.forEach(box => { box.checked = selectedGroups.has(box.value); });
+    SOURCE_GROUPS.forEach(group => {
+      const count = document.querySelector(`.source-group-item input[value="${group.id}"]`)?.parentElement.querySelector('.source-group-count');
+      if (count) count.textContent = selectedGroups.has(group.id) ? String(group.count) : `0 / ${group.count}`;
+    });
+
+    document.querySelectorAll('.callflow-section').forEach(section => {
+      let counts = {};
+      try { counts = JSON.parse(section.dataset.groupCounts || '{}'); } catch (_error) {}
+      let rowCounts = {};
+      try { rowCounts = JSON.parse(section.dataset.rowCounts || '{}'); } catch (_error) {}
+      const total = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
+      const visible = Object.entries(counts).reduce((sum, [group, count]) =>
+        sum + (selectedGroups.has(group) ? Number(count || 0) : 0), 0);
+      const shown = Object.entries(rowCounts).reduce((sum, [group, count]) =>
+        sum + (selectedGroups.has(group) ? Number(count || 0) : 0), 0);
+      section.hidden = visible === 0;
+      const counter = section.querySelector('[data-section-count]');
+      if (counter) counter.textContent = filtered ? `(${visible}/${total} visible; ${shown} rows shown)` : `(${total} nodes; ${shown} rows shown)`;
+      const tableCount = section.querySelector('[data-table-count]');
+      if (tableCount) tableCount.textContent = `Showing ${shown} of ${visible} visible nodes; limit 30 per source group.`;
+    });
+
+    document.querySelectorAll('.call-table tr[data-source-group]').forEach(row => {
+      row.hidden = !selectedGroups.has(row.dataset.sourceGroup);
+    });
+    document.querySelectorAll('[data-ref-cell="true"]').forEach(cell => {
+      const refs = [...cell.querySelectorAll('.source-ref[data-source-group]')];
+      refs.forEach(ref => { ref.hidden = !selectedGroups.has(ref.dataset.sourceGroup); });
+      let empty = cell.querySelector('.filtered-ref-empty');
+      if (!empty) {
+        empty = document.createElement('span');
+        empty.className = 'filtered-ref-empty';
+        empty.textContent = 'No references in selected groups.';
+        cell.appendChild(empty);
+      }
+      empty.style.display = refs.length && !refs.some(ref => !ref.hidden) ? 'inline' : 'none';
+    });
+    document.querySelectorAll('.nav a').forEach(link => {
+      const targetId = (link.getAttribute('href') || '').slice(1);
+      const target = document.getElementById(targetId);
+      const section = target && target.closest('.callflow-section');
+      link.hidden = filtered && (targetId === 'overview' || Boolean(section && section.hidden));
+    });
+    const visibleNodeCount = SOURCE_GROUPS.reduce((sum, group) =>
+      sum + (selectedGroups.has(group.id) ? group.count : 0), 0);
+    document.getElementById('source-filter-count').textContent =
+      `Showing ${visibleNodeCount} of ${SOURCE_GROUPS.reduce((sum, group) => sum + group.count, 0)} indexed nodes.`;
+    if (persist && window.history && window.location) {
+      const state = { groups: SOURCE_GROUPS.filter(group => selectedGroups.has(group.id)).map(group => group.id) };
+      window.history.replaceState(null, '', '#filters=' + encodeURIComponent(JSON.stringify(state)));
+    }
+  }
+
+  checkboxes.forEach(box => box.addEventListener('change', () => {
+    if (box.checked) selectedGroups.add(box.value);
+    else selectedGroups.delete(box.value);
+    applyFilters();
+  }));
+  document.getElementById('source-select-all').addEventListener('click', () => {
+    knownGroups.forEach(group => selectedGroups.add(group));
+    applyFilters();
+  });
+  document.getElementById('source-clear-all').addEventListener('click', () => {
+    selectedGroups.clear();
+    applyFilters();
+  });
+  applyFilters(false);
+})();
+</script>
 
 <script>
 (function () {
@@ -1988,7 +2141,7 @@ def write_callflow_html(
 </script>
 
 </body>
-</html>""")
+</html>""".replace("{source_groups_json}", source_groups_json))
 
     # Write output
     output = "\n".join(html)

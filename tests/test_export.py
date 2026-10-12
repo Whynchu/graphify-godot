@@ -486,7 +486,7 @@ def test_html_source_groups_classify_paths_and_explicit_overrides(tmp_path, monk
     for group in ("docs", "tests", "scripts", "scenes", "resources", "tools", "addons", "config", "other"):
         assert f'"id": "{group}"' in html or f'"id":"{group}"' in html
     assert "isNodeVisible" in html
-    assert "hidden: !visibleIds.has(e.from) || !visibleIds.has(e.to)" in html
+    assert "hidden: !isEdgeVisible(e, visibleIds)" in html
     assert "#filters=" in html
     assert 'id="source-game-preset"' in html
     assert 'id="source-verification-preset"' in html
@@ -588,9 +588,56 @@ def test_html_aggregated_communities_retain_source_group_membership(tmp_path):
     gameplay = next(node for node in nodes if node["label"] == "Gameplay")
     assert set(gameplay["source_groups"]) == {"scripts", "tests"}
     assert gameplay["source_group_counts"] == {"scripts": 1, "tests": 1}
-    assert "Mixed communities stay visible" in html
-    assert "cannot separate members inside one community" in html
+    assert "recompute visible member counts and cross-community link contributions" in html
     assert "2 community nodes representing 3 source nodes" in html
+    edges = _vis_edges_from_html(html)
+    assert len(edges) == 1
+    assert edges[0]["source_group_counts"] == {"scripts": 1}
+    assert "visibleEdgeContributionCount" in html
+    assert "visibleMemberCount" in html
+
+
+def test_html_aggregates_recompute_group_member_and_link_counts(tmp_path):
+    import shutil
+    import subprocess
+    import networkx as nx
+    import pytest
+    from graphify.exporters.html import to_html
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+    graph = nx.Graph()
+    graph.add_node("script", label="GameScript", source_file="scripts/main.gd")
+    graph.add_node("test", label="CombatTest", source_file="tests/combat_test.gd")
+    graph.add_node("docs", label="Guide", source_file="docs/guide.md")
+    graph.add_edge("script", "docs", relation="references", confidence="EXTRACTED")
+    graph.add_edge("test", "docs", relation="tests", confidence="EXTRACTED")
+    output = tmp_path / "aggregate.html"
+    to_html(graph, {0: ["script", "test"], 1: ["docs"]}, str(output),
+            community_labels={0: "Gameplay", 1: "Docs"}, node_limit=2)
+    content = output.read_text(encoding="utf-8")
+    nodes = _vis_nodes_from_html(content)
+    edges = _vis_edges_from_html(content)
+    gameplay = next(entry for entry in nodes if entry["label"] == "Gameplay")
+    assert gameplay["source_group_counts"] == {"scripts": 1, "tests": 1}
+    assert edges[0]["source_group_counts"] == {"scripts": 1, "tests": 1}
+
+    start = content.index("function sourceGroupsForNode(node)")
+    end = content.index("function updateVisibility()", start)
+    helpers = content[start:end]
+    harness = f"""
+const hiddenSourceGroups = new Set(['tests']);
+const hiddenCommunities = new Set();
+{helpers}
+const community = {json.dumps(gameplay)};
+const edge = {json.dumps(edges[0])};
+const visibleIds = new Set([{json.dumps(gameplay['id'])}, {json.dumps(next(n['id'] for n in nodes if n['label'] == 'Docs'))}]);
+console.log(JSON.stringify({{members: visibleMemberCount(community), nodeVisible: isNodeVisible(community), links: visibleEdgeContributionCount(edge), edgeVisible: isEdgeVisible(edge, visibleIds)}}));
+"""
+    result = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"members": 1, "nodeVisible": True, "links": 1, "edgeVisible": True}
 
 
 def test_to_html_annotated_node_gets_learning_status_and_ring():
@@ -1524,7 +1571,7 @@ def test_to_html_aggregated_community_nodes_runtime(tmp_path):
     info_html = _run_node_info_harness(content, "0")
     assert '<div class="field"><b>Core Systems</b></div>' in info_html
     assert '<div class="field">Community: Core Systems</div>' in info_html
-    assert '<div class="field">Members: 25</div>' in info_html
+    assert '<div class="field">Members: 25 visible of 25</div>' in info_html
     assert '<div class="field">Degree: 1</div>' in info_html
     assert "Type: unknown" not in info_html
     assert "Source: -" not in info_html

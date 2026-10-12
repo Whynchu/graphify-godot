@@ -9,13 +9,15 @@ now raises/exits 1; the default computed root and partial matches stay exit 0.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from graphify.tree_html import build_tree
+from graphify.tree_html import build_tree, emit_html
 
 PYTHON = sys.executable
 
@@ -80,6 +82,65 @@ def test_build_tree_default_root_keeps_hierarchy():
     assert "a.py" in names and "sub" in names
 
 
+def _walk_tree(node: dict):
+    yield node
+    for child in node.get("children", []):
+        yield from _walk_tree(child)
+
+
+def test_build_tree_tracks_source_groups_and_grouped_truncation():
+    graph = {
+        "nodes": [
+            {"id": "doc", "label": "Guide", "source_file": "docs/guide.md"},
+            {"id": "script-a", "label": "Alpha", "source_file": "scripts/main.gd"},
+            {"id": "script-b", "label": "Beta", "source_file": "scripts/main.gd"},
+            {"id": "test", "label": "CombatTest", "source_file": "tests/combat.gd"},
+        ],
+        "links": [],
+    }
+    tree = build_tree(graph, max_children=1)
+    assert tree["total_count"] == 4
+    assert tree["source_group_counts"] == {"docs": 1, "scripts": 2, "tests": 1}
+    truncation = next(node for node in _walk_tree(tree) if node.get("truncated"))
+    assert truncation["name"] == "(+1 more Scripts)"
+    assert truncation["source_group"] == "scripts"
+    script_file = next(node for node in _walk_tree(tree) if node["name"] == "main.gd")
+    assert script_file["source_group_counts"] == {"scripts": 2}
+
+
+def test_tree_filtering_recomputes_visible_symbol_totals(tmp_path):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+    graph = {
+        "nodes": [
+            {"id": "doc", "label": "Guide", "source_file": "docs/guide.md"},
+            {"id": "script-a", "label": "Alpha", "source_file": "scripts/main.gd"},
+            {"id": "script-b", "label": "Beta", "source_file": "scripts/main.gd"},
+            {"id": "test", "label": "CombatTest", "source_file": "tests/combat.gd"},
+        ],
+        "links": [],
+    }
+    tree = build_tree(graph, max_children=1)
+    html = emit_html(tree, title="test", header="test")
+    match = re.search(
+        r"(    function filteredTreeNode\(node, isRoot = false\) \{.*?\n    \})\n\n    function updateSourceGroups",
+        html,
+        re.DOTALL,
+    )
+    assert match, "tree filter function was not emitted"
+    script = f"""
+const selectedSourceGroups = new Set(['scripts']);
+const initialJsonData = {json.dumps(tree)};
+{match.group(1)}
+const filtered = filteredTreeNode(initialJsonData, true);
+console.log(JSON.stringify({{ total: filtered.total_count, groups: filtered.source_group_counts }}));
+"""
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"total": 2, "groups": {"scripts": 2}}
+
+
 # ── CLI integration ───────────────────────────────────────────────────────────
 
 
@@ -104,6 +165,10 @@ def test_tree_cli_default_root_succeeds(tmp_path):
     # the hierarchy survives: pkg is the root, sub is an interior node
     assert '"name":"pkg"' in html
     assert '"name":"sub"' in html
+    assert 'id="source-filter-wrap"' in html
+    assert "className = 'source-group-cb'" in html
+    assert "#filters=" in html
+    assert '"source_group_counts":{"scripts":1}' in html
 
 
 def test_tree_cli_partial_match_root_succeeds(tmp_path):

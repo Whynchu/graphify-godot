@@ -39,6 +39,7 @@ import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from graphify.source_groups import SOURCE_GROUPS, source_group_for_node
 
 DEFAULT_MAX_CHILDREN = 200
 
@@ -141,6 +142,7 @@ def build_tree(
             sym_children.append({
                 "name": label,
                 "total_count": 1,
+                "source_group": source_group_for_node(n),
                 "children": [],
             })
         # Sort: code symbols first by name, then anything else.
@@ -149,13 +151,30 @@ def build_tree(
             c["name"].lower(),
         ))
         if len(sym_children) > max_children:
-            extra = len(sym_children) - max_children
+            omitted: Dict[str, int] = defaultdict(int)
+            for child in sym_children[max_children:]:
+                omitted[child["source_group"]] += int(child["total_count"])
             sym_children = sym_children[:max_children] + [
-                _make_truncation_leaf(extra),
+                {
+                    "name": f"(+{count} more {dict(SOURCE_GROUPS).get(group, group)})",
+                    "total_count": count,
+                    "source_group": group,
+                    "children": [],
+                    "truncated": True,
+                }
+                for group, count in sorted(omitted.items())
             ]
+        if not sym_children:
+            sym_children = [{
+                "name": "(no indexed symbols)",
+                "total_count": 1,
+                "source_group": source_group_for_node({"source_file": src_file}),
+                "children": [],
+            }]
         file_node = {
             "name": src_path.name,
-            "total_count": len(sym_children) or 1,
+            "total_count": sum(int(child["total_count"]) for child in sym_children),
+            "source_group_counts": {},
             "children": sym_children,
         }
         parent_dir["children"].append(file_node)
@@ -179,11 +198,18 @@ def build_tree(
             c["name"].lower(),
         ))
         if not kids:
-            return d.get("total_count") or 1
+            group = str(d.get("source_group") or "other")
+            count = int(d.get("total_count") or 1)
+            d["source_group_counts"] = {group: count}
+            return count
         n = 0
+        group_counts: Dict[str, int] = defaultdict(int)
         for c in kids:
             n += _finalise(c)
+            for group, count in c.get("source_group_counts", {}).items():
+                group_counts[group] += int(count)
         d["total_count"] = n or 1
+        d["source_group_counts"] = dict(sorted(group_counts.items()))
         return d["total_count"]
 
     _finalise(root_node)
@@ -216,6 +242,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     .controls {{
       margin: 20px 0 15px 24px;
     }}
+    #source-filter-wrap {{ margin: 0 24px 14px; padding: 12px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }}
+    #source-filter-wrap button {{ margin: 8px 8px 0 0; padding: 5px 10px; font-size: 0.85rem; }}
+    #source-groups {{ display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 8px; }}
+    .source-group-item {{ font-size: 0.9rem; white-space: nowrap; }}
+    #tree-count {{ margin-top: 7px; color: #555; font-size: 0.85rem; }}
     button {{
       margin-right: 10px;
       padding: 8px 18px;
@@ -275,6 +306,13 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <button onclick="collapseAll()">Collapse All</button>
     <button onclick="resetView()">Reset View</button>
   </div>
+  <div id="source-filter-wrap" role="group" aria-label="Source group filters">
+    <strong>Source groups</strong>
+    <button type="button" id="source-select-all">Select all</button>
+    <button type="button" id="source-clear-all">Clear all</button>
+    <div id="source-groups"></div>
+    <div id="tree-count" aria-live="polite"></div>
+  </div>
   <div id="tree-container">
     <svg id="tree-svg" width="{svg_width}" height="{svg_height}"></svg>
   </div>
@@ -282,6 +320,76 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   <script src="https://d3js.org/d3.v7.min.js"></script>
   <script>
     const initialJsonData = {data_json};
+    const SOURCE_GROUPS = {source_groups_json};
+    const selectedSourceGroups = new Set(SOURCE_GROUPS.map(group => group.id));
+    if (window.location.hash.startsWith('#filters=')) {{
+      try {{
+        const state = JSON.parse(decodeURIComponent(window.location.hash.slice(9)));
+        if (Array.isArray(state.groups)) {{
+          selectedSourceGroups.clear();
+          state.groups.forEach(id => {{ if (SOURCE_GROUPS.some(group => group.id === id)) selectedSourceGroups.add(id); }});
+        }}
+      }} catch (_error) {{ /* Invalid shared state keeps all groups selected. */ }}
+    }}
+
+    const sourceGroupsElement = document.getElementById('source-groups');
+    SOURCE_GROUPS.forEach(group => {{
+      const label = document.createElement('label');
+      label.className = 'source-group-item';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = group.id;
+      checkbox.checked = selectedSourceGroups.has(group.id);
+      checkbox.className = 'source-group-cb';
+      checkbox.setAttribute('aria-label', `${{group.label}} source group`);
+      checkbox.addEventListener('change', () => {{
+        if (checkbox.checked) selectedSourceGroups.add(group.id);
+        else selectedSourceGroups.delete(group.id);
+        updateSourceGroups();
+      }});
+      const total = Number(initialJsonData.source_group_counts?.[group.id] || 0);
+      label.append(checkbox, ` ${{group.label}} (${{total}})`);
+      sourceGroupsElement.appendChild(label);
+    }});
+
+    function filteredTreeNode(node, isRoot = false) {{
+      const children = (node.children || []).map(child => filteredTreeNode(child)).filter(Boolean);
+      if ((node.children || []).length) {{
+        if (!children.length && !isRoot) return null;
+        const count = children.reduce((sum, child) => sum + Number(child.total_count || 0), 0);
+        const groupCounts = {{}};
+        children.forEach(child => Object.entries(child.source_group_counts || {{}}).forEach(([group, value]) => {{
+          groupCounts[group] = (groupCounts[group] || 0) + Number(value || 0);
+        }}));
+        return {{ ...node, total_count: count, source_group_counts: groupCounts, children }};
+      }}
+      if (isRoot) return {{ ...node, total_count: 0, source_group_counts: {{}}, children: [] }};
+      return selectedSourceGroups.has(node.source_group)
+        ? {{ ...node, source_group_counts: {{ [node.source_group]: Number(node.total_count || 1) }} }} : null;
+    }}
+
+    function updateSourceGroups() {{
+      document.querySelectorAll('.source-group-cb').forEach(cb => {{ cb.checked = selectedSourceGroups.has(cb.value); }});
+      const filtered = filteredTreeNode(initialJsonData, true);
+      document.getElementById('tree-count').textContent =
+        `Showing ${{filtered.total_count || 0}} of ${{initialJsonData.total_count || 0}} indexed symbols (per-file omitted symbols are summarized by source group).`;
+      if (window.history && window.location) {{
+        const state = {{ groups: SOURCE_GROUPS.filter(group => selectedSourceGroups.has(group.id)).map(group => group.id) }};
+        window.history.replaceState(null, '', '#filters=' + encodeURIComponent(JSON.stringify(state)));
+      }}
+      treeData = transformData(filtered);
+      rootNode = makeRootNode(treeData);
+      updateTree(rootNode);
+    }}
+
+    document.getElementById('source-select-all').addEventListener('click', () => {{
+      SOURCE_GROUPS.forEach(group => selectedSourceGroups.add(group.id));
+      updateSourceGroups();
+    }});
+    document.getElementById('source-clear-all').addEventListener('click', () => {{
+      selectedSourceGroups.clear();
+      updateSourceGroups();
+    }});
 
     function transformData(jsonData) {{
         // Helper function to recursively build the children structure
@@ -322,7 +430,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         }};
     }}
 
-    const treeData = transformData(initialJsonData);
+    let treeData = transformData(filteredTreeNode(initialJsonData, true));
 
     // Auto-populated phaseColors: every depth-1 child of the root gets
     // a stable colour from a bigger palette so all top-level dirs are
@@ -364,16 +472,15 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     let nodeCounter = 0;
     const g = svgElement.append("g").attr("transform", `translate(${{margin.left}},${{margin.top}})`);
     const treemap = d3.tree().nodeSize([40, 0]);
-    let rootNode = d3.hierarchy(treeData, d => d.children);
-    rootNode.x0 = 0;
-    rootNode.y0 = 0;
-
-    if (rootNode.children) {{
-      rootNode.children.forEach(d_child => {{
-        if (d_child.children) {{ collapseBranch(d_child); }}
-      }});
+    function makeRootNode(data) {{
+      const root = d3.hierarchy(data, d => d.children);
+      root.x0 = 0;
+      root.y0 = 0;
+      if (root.children) root.children.forEach(child => {{ if (child.children) collapseBranch(child); }});
+      return root;
     }}
-    updateTree(rootNode);
+    let rootNode = makeRootNode(treeData);
+    updateSourceGroups();
 
     function collapseBranch(d) {{ if (d.children) {{ d._children = d.children; d._children.forEach(collapseBranch); d.children = null; }} }}
     function expandBranch(d) {{ if (d._children) {{ d.children = d._children; d._children = null; }} if (d.children) {{ d.children.forEach(expandBranch); }} }}
@@ -572,12 +679,18 @@ def emit_html(
     # element (escaping only `</` leaves the `<!--` + `<script` breakout open, #4124),
     # and HTML-escape values that land in <title>/<h1>.
     data_json = json.dumps(tree, ensure_ascii=True, separators=(",", ":")).replace("<", "\\u003c")
+    source_groups_json = json.dumps(
+        [{"id": group_id, "label": label} for group_id, label in SOURCE_GROUPS],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).replace("<", "\\u003c")
     return _HTML_TEMPLATE.format(
         title=_html.escape(title),
         header=_html.escape(header),
         svg_width=svg_width,
         svg_height=svg_height,
         data_json=data_json,
+        source_groups_json=source_groups_json,
     )
 
 

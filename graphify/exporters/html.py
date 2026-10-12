@@ -4,92 +4,18 @@ from __future__ import annotations
 from graphify.exporters.base import COMMUNITY_COLORS  # noqa: E402,F401
 from pathlib import Path
 import html as _html
-import fnmatch
 import os
 from graphify.analyze import _node_community_map
 from graphify.paths import write_text_atomic
 import json
 import networkx as nx
 from graphify.security import sanitize_label
+from graphify.source_groups import SOURCE_GROUPS, source_group_for_node as _source_group_for_node, source_groups_for_node as _source_groups_for_node
 
 
 MAX_NODES_FOR_VIZ = 5_000
 _HTML_STALE_MARKER = ".graph.html.stale"
-SOURCE_GROUPS = (
-    ("docs", "Docs"),
-    ("tests", "Tests"),
-    ("scripts", "Scripts"),
-    ("scenes", "Scenes"),
-    ("resources", "Resources"),
-    ("tools", "Tools"),
-    ("addons", "Addons"),
-    ("config", "Config"),
-    ("other", "Other"),
-)
-_SOURCE_GROUP_IDS = {group_id for group_id, _label in SOURCE_GROUPS}
 
-
-def _source_group_for_node(data: dict) -> str:
-    """Classify a graph node by explicit override, source ownership, then suffix."""
-    explicit = str(data.get("source_group") or "").strip().lower()
-    if explicit in _SOURCE_GROUP_IDS:
-        return explicit
-
-    source = str(data.get("source_file") or data.get("path") or "")
-    normalized = source.replace("\\", "/").casefold()
-    parts = [part for part in normalized.split("/") if part]
-    suffix = Path(source).suffix.casefold()
-
-    # Project-specific rules are JSON so shell wrappers and CI can share the
-    # same portable configuration. Patterns match the complete normalized
-    # path or any suffix, allowing `vendor/**` to work on absolute paths too.
-    try:
-        overrides = json.loads(os.environ.get("GRAPHIFY_SOURCE_GROUP_OVERRIDES", "{}"))
-    except (TypeError, ValueError):
-        overrides = {}
-    if isinstance(overrides, dict):
-        candidates = [normalized]
-        candidates.extend("/".join(parts[index:]) for index in range(len(parts)))
-        for pattern, group in overrides.items():
-            group_id = str(group).strip().lower()
-            if group_id not in _SOURCE_GROUP_IDS:
-                continue
-            normalized_pattern = str(pattern).replace("\\", "/").casefold().lstrip("/")
-            if normalized_pattern and any(fnmatch.fnmatchcase(candidate, normalized_pattern) for candidate in candidates):
-                return group_id
-
-    # Ownership wins over fixture type: addon/tool tests stay with their owner.
-    if any(part in {"addons", "addon", "plugins", "plugin"} for part in parts):
-        return "addons"
-    if any(part in {"tools", "tooling", "scripts_tools"} for part in parts):
-        return "tools"
-    if any(part in {"tests", "test", "spec", "specs", "verification"} for part in parts):
-        return "tests"
-    if suffix in {".md", ".rst", ".adoc", ".txt"}:
-        return "docs"
-    if suffix == ".tscn":
-        return "scenes"
-    if suffix in {".tres", ".res", ".scn"}:
-        return "resources"
-    if suffix in {".godot", ".toml", ".ini", ".cfg", ".yaml", ".yml", ".json", ".csv", ".xml"}:
-        return "config"
-    if suffix in {
-        ".gd", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-        ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".java", ".kt", ".kts",
-        ".rs", ".go", ".rb", ".php", ".swift", ".lua", ".sh", ".ps1", ".sql",
-    }:
-        return "scripts"
-    return "other"
-
-
-def _source_groups_for_node(data: dict) -> list[str]:
-    """Return source groups represented by a node, including aggregate nodes."""
-    raw = data.get("source_groups")
-    if isinstance(raw, (list, tuple, set)):
-        groups = sorted({str(value).strip().lower() for value in raw} & _SOURCE_GROUP_IDS)
-        if groups:
-            return groups
-    return [_source_group_for_node(data)]
 
 def _viz_node_limit() -> int:
     """Return the effective viz node limit, honoring GRAPHIFY_VIZ_NODE_LIMIT env var.
@@ -184,7 +110,14 @@ function convexHull(pts) {{
 }}
 network.on('afterDrawing', function(ctx) {{
     hyperedges.forEach(h => {{
-        const positions = h.nodes
+        const groupNodes = h.source_group_nodes;
+        const participantIds = groupNodes
+            ? [...new Set(SOURCE_GROUPS
+                .filter(group => !hiddenSourceGroups.has(group.id))
+                .flatMap(group => groupNodes[group.id] || []))]
+            : h.nodes;
+        const positions = participantIds
+            .filter(nid => {{ const node = nodesDS.get(nid); return node && !node.hidden; }})
             .map(nid => network.getPositions([nid])[nid])
             .filter(p => p !== undefined);
         if (positions.length < 2) return;
@@ -260,6 +193,7 @@ const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({{
   width: e.width,
   color: e.color,
   arrows: {{ to: {{ enabled: true, scaleFactor: 0.5 }} }},
+  source_group_counts: e.source_group_counts,
 }})));
 
 const container = document.getElementById('graph');
@@ -298,7 +232,11 @@ function showInfo(nodeId) {{
   const allNeighborIds = [...new Set(RAW_EDGES
     .filter(e => e.from === nodeId || e.to === nodeId)
     .map(e => e.from === nodeId ? e.to : e.from))];
-  const neighborIds = allNeighborIds.filter(id => isNodeVisible(RAW_NODES.find(n => n.id === id)));
+  const visibleIds = new Set(RAW_NODES.filter(isNodeVisible).map(n => n.id));
+  const neighborIds = allNeighborIds.filter(id =>
+    isNodeVisible(RAW_NODES.find(n => n.id === id))
+    && RAW_EDGES.some(e => (e.from === nodeId && e.to === id || e.to === nodeId && e.from === id)
+      && isEdgeVisible(e, visibleIds)));
   const neighborItems = neighborIds.map(nid => {{
     const nb = nodesDS.get(nid);
     const color = nb ? nb.color.background : '#555';
@@ -314,14 +252,15 @@ function showInfo(nodeId) {{
     const groupNames = n.source_groups.map(id => {{
       const label = SOURCE_GROUPS.find(g => g.id === id)?.label || id;
       const count = n.source_group_counts && n.source_group_counts[id];
-      return count ? `${{label}} (${{count}})` : label;
+      const visibleCount = count && !hiddenSourceGroups.has(id) && !hiddenCommunities.has(n.community) ? count : 0;
+      return count ? `${{label}} (${{visibleCount}} / ${{count}})` : label;
     }}).join(', ');
     html += `<div class="field">Source groups: ${{esc(groupNames)}}</div>`;
   }}
   if (!isMetaNode) {{
     html += `<div class="field">Source: ${{esc(n.source_file || '-')}}</div>`;
   }} else if (n.member_count !== undefined && n.member_count !== null) {{
-    html += `<div class="field">Members: ${{esc(n.member_count)}}</div>`;
+    html += `<div class="field">Members: ${{esc(visibleMemberCount(n))}} visible of ${{esc(n.member_count)}}</div>`;
   }}
   html += `<div class="field">Degree: ${{n.degree}}</div>`;
   if (neighborIds.length || allNeighborIds.length) {{
@@ -409,26 +348,71 @@ document.addEventListener('click', e => {{
 const hiddenCommunities = new Set();
 const hiddenSourceGroups = new Set();
 
-function isNodeVisible(node) {{
-  const groups = node && Array.isArray(node.source_groups) && node.source_groups.length
+function sourceGroupsForNode(node) {{
+  return node && Array.isArray(node.source_groups) && node.source_groups.length
     ? node.source_groups : (node ? [node.source_group] : []);
-  return Boolean(node) && !hiddenCommunities.has(node.community) && groups.some(group => !hiddenSourceGroups.has(group));
+}}
+
+function sourceGroupCount(node, groupId) {{
+  const counts = node && node.source_group_counts;
+  if (counts && typeof counts === 'object') return Number(counts[groupId] || 0);
+  return sourceGroupsForNode(node).includes(groupId) ? 1 : 0;
+}}
+
+function visibleMemberCount(node) {{
+  const counts = node && node.source_group_counts;
+  if (counts && typeof counts === 'object' && Object.keys(counts).length) {{
+    return Object.entries(counts).reduce((sum, [group, count]) =>
+      sum + (hiddenSourceGroups.has(group) ? 0 : Number(count || 0)), 0);
+  }}
+  return sourceGroupsForNode(node).some(group => !hiddenSourceGroups.has(group))
+    ? Number(node && node.member_count || 1) : 0;
+}}
+
+function isNodeVisible(node) {{
+  return Boolean(node) && !hiddenCommunities.has(node.community) && visibleMemberCount(node) > 0;
+}}
+
+function visibleEdgeContributionCount(edge) {{
+  const counts = edge && edge.source_group_counts;
+  if (!counts || typeof counts !== 'object') return 1;
+  return Object.entries(counts).reduce((sum, [group, count]) =>
+    sum + (hiddenSourceGroups.has(group) ? 0 : Number(count || 0)), 0);
+}}
+
+function isEdgeVisible(edge, visibleIds) {{
+  return Boolean(edge) && visibleIds.has(edge.from) && visibleIds.has(edge.to)
+    && visibleEdgeContributionCount(edge) > 0;
 }}
 
 function updateVisibility() {{
   const visibleIds = new Set(RAW_NODES.filter(isNodeVisible).map(n => n.id));
-  nodesDS.update(RAW_NODES.map(n => ({{ id: n.id, hidden: !visibleIds.has(n.id) }})));
+  nodesDS.update(RAW_NODES.map(n => ({{
+    id: n.id,
+    hidden: !visibleIds.has(n.id),
+    size: n.member_count
+      ? 10 + (Number(n.size || 10) - 10) * Math.sqrt(visibleMemberCount(n) / Number(n.member_count || 1))
+      : n.size,
+  }})));
   edgesDS.update(RAW_EDGES.map((e, i) => ({{
-    id: i, hidden: !visibleIds.has(e.from) || !visibleIds.has(e.to)
+    id: i,
+    hidden: !isEdgeVisible(e, visibleIds),
+    title: e.source_group_counts
+      ? `${{visibleEdgeContributionCount(e)}} visible cross-community links`
+      : e.title,
   }})));
   LEGEND.forEach(c => {{
-    const visible = RAW_NODES.filter(n => n.community === c.cid && visibleIds.has(n.id)).length;
+    const visible = RAW_NODES
+      .filter(n => n.community === c.cid && visibleIds.has(n.id))
+      .reduce((sum, n) => sum + visibleMemberCount(n), 0);
     const countEl = document.getElementById(`community-count-${{c.cid}}`);
     if (countEl) countEl.textContent = visible === c.count ? String(c.count) : `${{visible}} / ${{c.count}}`;
   }});
   SOURCE_GROUPS.forEach(g => {{
-    const total = RAW_NODES.filter(n => Array.isArray(n.source_groups) ? n.source_groups.includes(g.id) : n.source_group === g.id).length;
-    const visible = RAW_NODES.filter(n => (Array.isArray(n.source_groups) ? n.source_groups.includes(g.id) : n.source_group === g.id) && visibleIds.has(n.id)).length;
+    const total = RAW_NODES.reduce((sum, n) => sum + sourceGroupCount(n, g.id), 0);
+    const visible = RAW_NODES
+      .filter(n => !hiddenCommunities.has(n.community))
+      .reduce((sum, n) => sum + sourceGroupCount(n, g.id), 0);
     const countEl = document.getElementById(`source-group-count-${{g.id}}`);
     if (countEl) countEl.textContent = visible === total ? String(total) : `${{visible}} / ${{total}}`;
   }});
@@ -436,8 +420,11 @@ function updateVisibility() {{
   if (selected.length && !visibleIds.has(selected[0])) {{
     network.unselectAll();
     document.getElementById('info-content').innerHTML = '<span class="empty">Click a node to inspect it</span>';
+  }} else if (selected.length) {{
+    showInfo(selected[0]);
   }}
   if (searchInput.dispatchEvent) searchInput.dispatchEvent(new Event('input'));
+  if (typeof network.redraw === 'function') network.redraw();
 }}
 
 function persistFilters() {{
@@ -681,13 +668,23 @@ def to_html(
                     source_group_counts=group_counts,
                 )
             edge_counts = _Counter()
-            for u, v in G.edges():
+            for u, v, edge_data in G.edges(data=True):
                 cu, cv = node_to_community.get(u), node_to_community.get(v)
-                if cu is not None and cv is not None and cu != cv:
-                    edge_counts[(min(cu, cv), max(cu, cv))] += 1
-            for (cu, cv), w in edge_counts.items():
+                if cu is None or cv is None or cu == cv:
+                    continue
+                true_source = edge_data.get("_src", u)
+                source_data = G.nodes[true_source] if true_source in G else G.nodes[u]
+                group_id = _source_group_for_node(source_data)
+                edge_counts[(min(cu, cv), max(cu, cv), group_id)] += 1
+            edge_groups_by_pair: dict[tuple[int, int], dict[str, int]] = {}
+            for (cu, cv, group_id), count in edge_counts.items():
+                edge_groups_by_pair.setdefault((cu, cv), {})[group_id] = count
+            for (cu, cv), group_counts in edge_groups_by_pair.items():
+                w = sum(group_counts.values())
                 meta.add_edge(str(cu), str(cv), weight=w,
-                              relation=f"{w} cross-community edges", confidence="AGGREGATED")
+                              relation=f"{w} cross-community edges", confidence="AGGREGATED",
+                              source_group_counts=group_counts,
+                              source_groups=sorted(group_counts))
             if meta.number_of_nodes() <= 1:
                 print("Single community - aggregated view not useful. Skipping graph.html.")
                 return False
@@ -711,10 +708,17 @@ def to_html(
                         comm_ids.append(s)
                     if len(comm_ids) < 2:
                         continue
+                    group_nodes: dict[str, set[str]] = {}
+                    for nid in he_members:
+                        cid = node_to_community.get(nid)
+                        if cid is None:
+                            continue
+                        group_nodes.setdefault(_source_group_for_node(G.nodes[nid]), set()).add(str(cid))
                     remapped.append({
                         "id": he.get("id", ""),
                         "label": he.get("label") or he.get("relation", "").replace("_", " "),
                         "nodes": comm_ids,
+                        "source_group_nodes": {group: sorted(group_ids) for group, group_ids in group_nodes.items()},
                     })
                 meta.graph["hyperedges"] = remapped
             meta.graph["source_node_count"] = G.number_of_nodes()
@@ -845,6 +849,7 @@ def to_html(
             "width": 2 if confidence == "EXTRACTED" else 1,
             "color": {"opacity": 0.7 if confidence == "EXTRACTED" else 0.35},
             "confidence": confidence,
+            "source_group_counts": data.get("source_group_counts"),
         })
 
     # Build community legend data
@@ -888,7 +893,7 @@ def to_html(
         for _node_id, data in G.nodes(data=True)
     )
     source_group_note = (
-        '<div id="source-group-note">This is a community summary. Mixed communities stay visible while any represented group is enabled; group filters cannot separate members inside one community. Node Info shows represented group counts.</div>'
+        '<div id="source-group-note">This is a bounded community summary. Group filters recompute visible member counts and cross-community link contributions; each community remains aggregated, so individual member nodes cannot be inspected here. Node Info shows per-group visible and total counts.</div>'
         if has_aggregated_source_groups else ""
     )
 
