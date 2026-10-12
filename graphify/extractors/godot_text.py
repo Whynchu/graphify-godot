@@ -85,7 +85,7 @@ def read_uid_sidecar(path: Path) -> str | None:
     return match.group(0) if match else None
 
 
-def _without_comment(line: str) -> str:
+def _without_comment(line: str, comment_chars: str = "#") -> str:
     quote = ""
     escaped = False
     for index, char in enumerate(line):
@@ -98,7 +98,7 @@ def _without_comment(line: str) -> str:
                 quote = ""
         elif char in ("\"", "'"):
             quote = char
-        elif char == "#":
+        elif char in comment_chars:
             return line[:index]
     return line
 
@@ -490,7 +490,7 @@ def _summarize_value(raw: str) -> tuple[object, list[str]]:
     return {"type": "opaque", "text": value[:_MAX_VALUE_LENGTH]}, []
 
 
-def _parse_sections(text: str) -> tuple[list[_Section], list[dict]]:
+def _parse_sections(text: str, *, project_settings: bool = False) -> tuple[list[_Section], list[dict]]:
     sections: list[_Section] = []
     diagnostics: list[dict] = []
     current: _Section | None = None
@@ -498,7 +498,7 @@ def _parse_sections(text: str) -> tuple[list[_Section], list[dict]]:
     pending_value = ""
     pending_line = 0
     for line_number, source_line in enumerate(text.splitlines(), start=1):
-        clean = _without_comment(source_line).strip()
+        clean = _without_comment(source_line, "#;" if project_settings else "#").strip()
         if not clean:
             if pending_key is not None:
                 pending_value += "\n"
@@ -532,6 +532,13 @@ def _parse_sections(text: str) -> tuple[list[_Section], list[dict]]:
             diagnostics.append({"kind": "godot_text_parse_error", "line": line_number, "message": "Expected a key=value assignment or section header."})
             continue
         if current is None:
+            if project_settings and assignment[0] == "config_version" and re.fullmatch(r"\d+", assignment[1].strip()):
+                header = next((section for section in sections if section.kind == "__project_header__"), None)
+                if header is None:
+                    header = _Section("__project_header__", {}, line_number)
+                    sections.insert(0, header)
+                header.properties.append({"name": assignment[0], "value": assignment[1].strip(), "line": line_number})
+                continue
             diagnostics.append({"kind": "godot_text_parse_error", "line": line_number, "message": "Property appears before the first section."})
             continue
         pending_key, pending_value = assignment
@@ -930,7 +937,7 @@ def extract_godot_project(path: Path, *, root: Path | None = None) -> dict:
 
     source_file = str(path)
     context = godot_project_context(path, root)
-    sections, diagnostics = _parse_sections(raw.decode("utf-8", errors="replace"))
+    sections, diagnostics = _parse_sections(raw.decode("utf-8", errors="replace"), project_settings=True)
     section_map = {section.kind: section for section in sections}
     application = section_map.get("application")
     application_values = {prop["name"]: prop for prop in application.properties} if application else {}
@@ -950,6 +957,11 @@ def extract_godot_project(path: Path, *, root: Path | None = None) -> dict:
         "plugins": [],
         "diagnostics": diagnostics[:100],
     }
+    project_header = section_map.get("__project_header__")
+    if project_header is not None:
+        version = next((prop["value"] for prop in project_header.properties if prop["name"] == "config_version"), "")
+        if version:
+            project_facts["config_version"] = int(version)
 
     nodes = [{
         "id": file_id,

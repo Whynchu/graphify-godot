@@ -25,12 +25,97 @@ _GDSCRIPT_CONFIG = LanguageConfig(
 _MAX_SCRIPT_RESOURCE_REFS = 10_000
 _MAX_SCRIPT_CLASS_REFS = 50_000
 _GODOT_SOURCE_SUFFIXES = frozenset({".gd", ".tres", ".tscn", ".godot"})
+_INLINE_COMPOUND_HEADER_RE = re.compile(r"^\s*(?:(?:static)\s+)*func\b|^\s*(?:if|elif|else|for|while|match|class)\b")
 
 
 def _node_text(node, source: bytes) -> str:
     if node is None:
         return ""
     return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+
+def _normalize_inline_compound_statements(source: bytes) -> tuple[bytes, list[int], int]:
+    """Put supported one-line compound suites on indented parser lines.
+
+    Godot accepts compact forms such as ``if ready: return`` and
+    ``func tick(): if ready: update()``. The bundled grammar is more reliable
+    with the equivalent multiline form. This source-preserving transform skips
+    comments and quoted strings and maps every inserted parser line back to its
+    original source line.
+    """
+    out = bytearray()
+    parser_line_to_source_line = [1]
+    source_line = 1
+    output_line_start = 0
+    index = 0
+    quote = 0
+    triple = False
+    escaped = False
+    comment = False
+    nesting = 0
+    splits = 0
+    while index < len(source):
+        char = source[index]
+        if char == 10:
+            out.append(char)
+            source_line += 1
+            parser_line_to_source_line.append(source_line)
+            output_line_start = len(out)
+            comment = False
+            index += 1
+            continue
+        if comment:
+            out.append(char)
+            index += 1
+            continue
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == 92:
+                escaped = True
+            elif triple and source[index:index + 3] == bytes((quote, quote, quote)):
+                out.extend(source[index:index + 3])
+                index += 3
+                quote = 0
+                triple = False
+                continue
+            elif not triple and char == quote:
+                quote = 0
+            out.append(char)
+            index += 1
+            continue
+        if char == 35:
+            comment = True
+            out.append(char)
+            index += 1
+            continue
+        if char in (34, 39):
+            quote = char
+            triple = source[index:index + 3] == bytes((char, char, char))
+            length = 3 if triple else 1
+            out.extend(source[index:index + length])
+            index += length
+            continue
+        if char in (40, 91, 123):  # ( [ {
+            nesting += 1
+        elif char in (41, 93, 125):  # ) ] }
+            nesting = max(0, nesting - 1)
+        if char == 58 and nesting == 0:
+            prefix = out[output_line_start:].decode("utf-8", errors="replace")
+            remainder = source[index + 1:].split(b"\n", 1)[0].strip(b" \t\r")
+            if _INLINE_COMPOUND_HEADER_RE.match(prefix) and remainder and not remainder.startswith(b"#"):
+                out.append(char)
+                out.append(10)
+                parser_line_to_source_line.append(source_line)
+                indent = prefix[:len(prefix) - len(prefix.lstrip(" \t"))]
+                out.extend(indent.encode("utf-8") + b"\t")
+                output_line_start = len(out) - len(indent.encode("utf-8")) - 1
+                splits += 1
+                index += 1
+                continue
+        out.append(char)
+        index += 1
+    return bytes(out), parser_line_to_source_line, splits
 
 
 def _normalize_semicolon_statements(source: bytes) -> tuple[bytes, list[int], int]:
@@ -611,11 +696,12 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                 param_name_node = next((child for child in parameter.named_children if child.type in {"identifier", "name"}), None)
                             param_type = _node_text(parameter.child_by_field_name("type"), source)
                             param_name = _node_text(param_name_node, source)
-                            if param_name and param_type:
+                            if param_name:
                                 receiver_bindings.append({
                                     "owner_class_line": owner_line, "caller_line": declaration.start_point[0] + 1,
                                     "name": param_name[:160], "type": param_type[:200],
                                     "line": parameter.start_point[0] + 1, "inferred": False,
+                                    "declared": bool(param_type), "unknown": not bool(param_type),
                                 })
 
                     local_names = local_names_for(declaration)
@@ -765,11 +851,13 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                 value_parts = value_node.named_children
                                 if len(value_parts) >= 2 and _node_text(value_parts[0], source)[:1].isupper() and _node_text(value_parts[1], source).startswith("new"):
                                     inferred_type = _node_text(value_parts[0], source)
-                            if var_name and ((var_type and var_type != ":=") or inferred_type):
+                            if var_name:
                                 receiver_bindings.append({
                                     "owner_class_line": owner_line, "caller_line": declaration.start_point[0] + 1,
                                     "name": var_name[:160], "type": (inferred_type or (var_type if var_type != ":=" else ""))[:200],
                                     "line": call_line, "inferred": bool(inferred_type),
+                                    "declared": bool(var_type and var_type != ":="),
+                                    "unknown": not bool(inferred_type or (var_type and var_type != ":=")),
                                 })
                         if call_node.type == "identifier":
                             property_name = _node_text(call_node, source)
@@ -827,6 +915,60 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                                         "line": call_line,
                                     })
                         stack.extend(reversed(call_node.named_children))
+                    # Reassigning an inferred local changes the receiver value.
+                    # Preserve a new type only for a straight-line, explicit
+                    # Class.new() assignment; branch/loop assignments fail
+                    # closed because the value after the block is uncertain.
+                    assignment_stack = [body] if body is not None else []
+                    assignments = []
+                    while assignment_stack:
+                        candidate = assignment_stack.pop()
+                        if candidate is not body and candidate.type in {"function_definition", "class_definition"}:
+                            continue
+                        if candidate.type in {"assignment", "augmented_assignment"}:
+                            assignments.append(candidate)
+                        assignment_stack.extend(reversed(candidate.named_children))
+                    for assignment in sorted(assignments, key=lambda item: (item.start_point[0], item.start_byte)):
+                        left = assignment.child_by_field_name("left")
+                        right = assignment.child_by_field_name("right")
+                        if left is None or left.type != "identifier":
+                            continue
+                        reassigned_name = _node_text(left, source)
+                        if not reassigned_name or reassigned_name not in local_names:
+                            continue
+                        line = assignment.start_point[0] + 1
+                        prior = [
+                            binding for binding in receiver_bindings
+                            if binding.get("owner_class_line") == owner_line
+                            and binding.get("caller_line") == declaration.start_point[0] + 1
+                            and binding.get("name") == reassigned_name
+                            and int(binding.get("line") or 0) < line
+                        ]
+                        if prior and max(prior, key=lambda binding: int(binding.get("line") or 0)).get("declared"):
+                            continue
+                        control_flow = {"if_statement", "elif_clause", "else_clause", "for_statement", "while_statement", "match_statement", "match_branch"}
+                        parent = assignment.parent
+                        conditional = False
+                        while parent is not None and parent is not body:
+                            if parent.type in control_flow:
+                                conditional = True
+                                break
+                            parent = parent.parent
+                        inferred_type = ""
+                        if not conditional and assignment.type == "assignment" and right is not None and right.type == "attribute":
+                            value_parts = right.named_children
+                            if len(value_parts) >= 2 and _node_text(value_parts[0], source)[:1].isupper() and _node_text(value_parts[1], source).startswith("new"):
+                                inferred_type = _node_text(value_parts[0], source)
+                        receiver_bindings.append({
+                            "owner_class_line": owner_line,
+                            "caller_line": declaration.start_point[0] + 1,
+                            "name": reassigned_name[:160],
+                            "type": inferred_type[:200],
+                            "line": line,
+                            "inferred": bool(inferred_type),
+                            "reassignment": True,
+                            "invalidated": not bool(inferred_type),
+                        })
             elif declaration.type == "variable_statement":
                 name = _node_text(declaration.child_by_field_name("name"), source)
                 annotations_node = declaration.child_by_field_name("annotations")
@@ -856,8 +998,8 @@ def _add_script_metadata(path: Path, source: bytes, result: dict, scan_root: Pat
                         else "named"
                     )
                 prop = add_member(owner_id, name, "script_property", declaration, property_metadata)
-                if prop and type_text:
-                    receiver_bindings.append({"owner_class_line": owner_line, "name": name[:160], "type": type_text, "line": declaration.start_point[0] + 1, "inferred": False})
+                if prop:
+                    receiver_bindings.append({"owner_class_line": owner_line, "name": name[:160], "type": type_text, "line": declaration.start_point[0] + 1, "inferred": False, "declared": bool(type_text), "unknown": not bool(type_text)})
             elif declaration.type == "signal_statement":
                 name = _node_text(declaration.child_by_field_name("name"), source)
                 params = _node_text(declaration.child_by_field_name("parameters"), source)
@@ -918,7 +1060,12 @@ def extract_gdscript(path: Path, *, root: Path | None = None) -> dict:
     except OSError as exc:
         return {"nodes": [], "edges": [], "error": str(exc)}
 
-    parser_source, parser_line_to_source_line, split_count = _normalize_semicolon_statements(source)
+    inline_source, inline_line_map, inline_split_count = _normalize_inline_compound_statements(source)
+    parser_source, parser_to_inline_line_map, semicolon_split_count = _normalize_semicolon_statements(inline_source)
+    parser_line_to_source_line = [
+        inline_line_map[min(line - 1, len(inline_line_map) - 1)]
+        for line in parser_to_inline_line_map
+    ]
     result = _extract_generic(
         path,
         _GDSCRIPT_CONFIG,
@@ -927,10 +1074,13 @@ def extract_gdscript(path: Path, *, root: Path | None = None) -> dict:
     )
     if not result.get("error"):
         _add_script_metadata(path, parser_source, result, root)
-        if split_count:
+        if inline_split_count or semicolon_split_count:
             file_node = next((node for node in result.get("nodes", []) if node.get("id") == _make_id(str(path))), None)
             if file_node is not None:
                 metadata = file_node.setdefault("metadata", {}).setdefault("godot_script", {})
-                metadata["parser_normalizations"] = {"semicolon_statement_splits": split_count}
+                metadata["parser_normalizations"] = {
+                    "inline_compound_splits": inline_split_count,
+                    "semicolon_statement_splits": semicolon_split_count,
+                }
         _restore_original_script_lines(result, parser_line_to_source_line)
     return result

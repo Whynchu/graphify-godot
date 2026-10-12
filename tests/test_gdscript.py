@@ -289,6 +289,104 @@ def test_typed_cross_script_calls_resolve_only_from_declared_receiver_types(tmp_
 
 
 @_needs_gdscript
+def test_receiver_reassignment_updates_or_invalidates_inferred_type(tmp_path: Path):
+    first = tmp_path / "review_first.gd"
+    first.write_text(
+        "class_name ReviewFirst\n"
+        "extends RefCounted\n"
+        "func ping() -> void:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    second = tmp_path / "review_second.gd"
+    second.write_text(
+        "class_name ReviewSecond\n"
+        "extends RefCounted\n"
+        "func ping() -> void:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    caller = tmp_path / "review_caller.gd"
+    caller.write_text(
+        "class_name ReviewCaller\n"
+        "func sequential() -> void:\n"
+        "    var receiver := ReviewFirst.new()\n"
+        "    receiver.ping()\n"
+        "    receiver = ReviewSecond.new()\n"
+        "    receiver.ping()\n"
+        "func conditional(condition: bool) -> void:\n"
+        "    var receiver := ReviewFirst.new()\n"
+        "    if condition:\n"
+        "        receiver = ReviewSecond.new()\n"
+        "    receiver.ping()\n",
+        encoding="utf-8",
+    )
+
+    from graphify.extract import extract
+    result = extract([first, second, caller], root=tmp_path, parallel=False)
+    nodes = {node["id"]: node for node in result["nodes"]}
+    method_owner = {
+        edge["target"]: nodes[edge["source"]]["label"]
+        for edge in result["edges"] if edge.get("relation") == "method"
+    }
+    calls = [edge for edge in result["edges"] if edge.get("relation") == "calls"]
+    sequential = next(node for node in result["nodes"] if node.get("label") == "sequential()")
+    conditional = next(node for node in result["nodes"] if node.get("label") == "conditional()")
+    sequential_targets = {
+        (edge.get("source_location"), method_owner.get(edge["target"]))
+        for edge in calls if edge.get("source") == sequential["id"]
+    }
+    assert ("L4", "ReviewFirst") in sequential_targets
+    assert ("L6", "ReviewSecond") in sequential_targets
+    assert not any(edge.get("source") == conditional["id"] for edge in calls)
+
+    caller_file = next(node for node in result["nodes"] if node.get("label") == "review_caller.gd")
+    diagnostics = caller_file["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any(item.get("kind") == "godot_receiver_type_invalidated" and item.get("line") == 11 for item in diagnostics)
+
+
+@_needs_gdscript
+def test_known_receiver_without_project_method_reports_unresolved_target(tmp_path: Path):
+    target = tmp_path / "review_first.gd"
+    target.write_text(
+        "class_name ReviewFirst\n"
+        "extends RefCounted\n"
+        "func present() -> void:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    unrelated = tmp_path / "unrelated.gd"
+    unrelated.write_text(
+        "class_name Unrelated\n"
+        "extends RefCounted\n"
+        "func graphify_missing_probe() -> void:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    caller = tmp_path / "review_caller.gd"
+    caller.write_text(
+        "func inspect(target: ReviewFirst) -> void:\n"
+        "    target.graphify_missing_probe()\n",
+        encoding="utf-8",
+    )
+
+    from graphify.extract import extract
+    result = extract([target, unrelated, caller], root=tmp_path, parallel=False)
+    assert not any(
+        edge.get("relation") == "calls"
+        and edge.get("source_location") == "L2"
+        for edge in result["edges"]
+    )
+    caller_file = next(node for node in result["nodes"] if node.get("label") == "review_caller.gd")
+    diagnostics = caller_file["metadata"]["godot_script"]["resolution_diagnostics"]
+    assert any(
+        item.get("kind") == "godot_receiver_method_not_found"
+        and "graphify_missing_probe" in item.get("message", "")
+        for item in diagnostics
+    )
+
+
+@_needs_gdscript
 def test_typed_cross_script_property_reads_and_writes_resolve_to_definitions(tmp_path: Path):
     definition = tmp_path / "enemy_definition.gd"
     definition.write_text(
@@ -404,6 +502,35 @@ def test_semicolon_separated_statements_parse_without_changing_source_lines(tmp_
     script_metadata = file_node["metadata"]["godot_script"]
     assert script_metadata["parser_normalizations"]["semicolon_statement_splits"] == 1
     assert not script_metadata.get("parser_diagnostics")
+
+
+@_needs_gdscript
+def test_inline_compound_statements_parse_with_original_locations(tmp_path: Path):
+    path = tmp_path / "inline_flow.gd"
+    path.write_text(
+        "class_name InlineFlow\n"
+        "func active(value: bool) -> void: if value: mark_active(); record()\n"
+        "func loop(points: Array[Vector2]) -> void:\n"
+        "    for point in points: if point.x > 0.0: record()\n"
+        "func choose(value: bool) -> void:\n"
+        "    if value: record()\n"
+        "    elif not value: record()\n"
+        "    else: pass\n"
+        "func quoted() -> String:\n"
+        '    return "if fake: not_a_block();" # if also_not_a_block: pass\n',
+        encoding="utf-8",
+    )
+
+    result = extract_gdscript(path)
+    file_node = next(node for node in result["nodes"] if node["label"] == "inline_flow.gd")
+    facts = file_node["metadata"]["godot_script"]
+    assert "parser_diagnostics" not in facts
+    assert facts["parser_normalizations"]["inline_compound_splits"] >= 6
+    active = next(node for node in result["nodes"] if node.get("label") == "active()")
+    assert active["source_location"] == "L2"
+    assert any(node.get("label") == "choose()" for node in result["nodes"])
+    assert any(node.get("label") == "quoted()" for node in result["nodes"])
+    assert all(reference.get("line") == 2 for reference in facts["call_references"] if reference.get("caller_name") == "active")
 
 
 @_needs_gdscript

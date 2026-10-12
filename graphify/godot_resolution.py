@@ -142,15 +142,61 @@ def _append_diagnostic(file_node: dict, kind: str, message: str, line: int | Non
         diagnostics.append(entry)
 
 
-def _append_script_diagnostic(file_node: dict, message: str, line: int | None = None) -> None:
+def _append_script_diagnostic(
+    file_node: dict,
+    message: str,
+    line: int | None = None,
+    *,
+    kind: str = "godot_unresolved_reference",
+) -> None:
     metadata = file_node.setdefault("metadata", {})
     script = metadata.setdefault("godot_script", {})
     diagnostics = script.setdefault("resolution_diagnostics", [])
-    entry = {"kind": "godot_unresolved_reference", "message": message[:300]}
+    entry = {"kind": kind, "message": message[:300]}
     if line:
         entry["line"] = int(line)
     if entry not in diagnostics and len(diagnostics) < 200:
         diagnostics.append(entry)
+
+
+def _receiver_bindings_for_reference(
+    facts: dict,
+    reference: dict,
+    receiver_name: str,
+) -> tuple[list[dict], bool, bool]:
+    """Return latest visible bindings, whether a reassignment invalidated them,
+    and whether a local binding shadows scene/property-name fallbacks.
+    """
+    owner_line = str(reference.get("owner_class_line") or "")
+    caller_line = str(reference.get("caller_line") or "")
+    all_bindings = [
+        binding for binding in facts.get("receiver_bindings", [])
+        if isinstance(binding, dict)
+        and str(binding.get("name") or "") == receiver_name
+        and str(binding.get("owner_class_line") or "") == owner_line
+    ]
+    local = [binding for binding in all_bindings if str(binding.get("caller_line") or "") == caller_line]
+    if not local:
+        return [binding for binding in all_bindings if not binding.get("caller_line")], False, False
+
+    reference_line = int(reference.get("line") or 1)
+    # The extractor's source normalization preserves line numbers but may split
+    # multiple statements that originally shared a line. Treat same-line
+    # reassignment as uncertain because statement order is not represented here.
+    same_line_reassignments = [
+        binding for binding in local
+        if binding.get("reassignment") and int(binding.get("line") or 0) == reference_line
+    ]
+    if same_line_reassignments:
+        return [], True, True
+    prior = [binding for binding in local if int(binding.get("line") or 0) < reference_line]
+    if not prior:
+        return [], False, True
+    latest_line = max(int(binding.get("line") or 0) for binding in prior)
+    latest = [binding for binding in prior if int(binding.get("line") or 0) == latest_line]
+    if any(binding.get("invalidated") for binding in latest):
+        return [], True, True
+    return latest, False, True
 
 
 def _append_reference_edge(
@@ -632,6 +678,25 @@ def resolve_godot_resources(
             first = False
         return None
 
+    def find_method_with_reason(class_id: str, method_name: str) -> tuple[dict | None, str]:
+        """Resolve project methods while preserving ambiguity as a diagnostic."""
+        seen: set[str] = set()
+        current = class_id
+        while current and current not in seen:
+            seen.add(current)
+            candidates = method_named(current, method_name)
+            if len(candidates) == 1:
+                return candidates[0], ""
+            if len(candidates) > 1:
+                return None, "ambiguous"
+            bases = base_classes.get(current, [])
+            if len(bases) > 1:
+                return None, "ambiguous_base"
+            if not bases:
+                return None, "not_in_project_hierarchy"
+            current = bases[0]
+        return None, "inheritance_cycle"
+
     base_classes: dict[str, list[str]] = defaultdict(list)
     for edge in all_edges:
         if edge.get("relation") == "inherits" and edge.get("source") and edge.get("target"):
@@ -772,6 +837,7 @@ def resolve_godot_resources(
             autoload_receiver = False
             preload_receiver_instance = False
             scene_attached_receiver = False
+            local_receiver_binding = False
             if not caller_id or not method_name:
                 continue
             target_classes: list[str] = []
@@ -806,21 +872,16 @@ def resolve_godot_resources(
                             _append_script_diagnostic(file["node"], f"Preload alias {receiver_name!r} is ambiguous in this script scope.", int(reference.get("line") or 1))
             elif receiver_kind == "identifier":
                 receiver_name = str(reference.get("receiver") or "")
-                binding_matches = [
-                    binding for binding in facts.get("receiver_bindings", [])
-                    if isinstance(binding, dict)
-                    and str(binding.get("name") or "") == receiver_name
-                    and str(binding.get("owner_class_line") or "") == str(reference.get("owner_class_line") or "")
-                    and (not binding.get("caller_line") or str(binding.get("caller_line")) == str(reference.get("caller_line")))
-                ]
-                if not binding_matches:
-                    binding_matches = [
-                        binding for binding in facts.get("receiver_bindings", [])
-                        if isinstance(binding, dict)
-                        and str(binding.get("name") or "") == receiver_name
-                        and str(binding.get("owner_class_line") or "") == str(reference.get("owner_class_line") or "")
-                        and not binding.get("caller_line")
-                    ]
+                binding_matches, binding_invalidated, local_receiver_binding = _receiver_bindings_for_reference(
+                    facts, reference, receiver_name
+                )
+                if binding_invalidated:
+                    _append_script_diagnostic(
+                        file["node"],
+                        f"Receiver {receiver_name!r} has no statically safe type after reassignment; its call target was left unresolved.",
+                        int(reference.get("line") or 1),
+                        kind="godot_receiver_type_invalidated",
+                    )
                 type_names = {str(binding.get("type") or "").strip() for binding in binding_matches}
                 if len(type_names) == 1:
                     type_name = next(iter(type_names))
@@ -841,14 +902,14 @@ def resolve_godot_resources(
                                 inferred_receiver = any(bool(binding.get("inferred")) for binding in binding_matches)
                             elif len(aliases) > 1:
                                 _append_script_diagnostic(file["node"], f"Preload alias type {type_name!r} is ambiguous in this script scope.", int(reference.get("line") or 1))
-                if not target_classes:
+                if not target_classes and (not local_receiver_binding or not binding_invalidated):
                     scene_targets = node_receiver_script_targets.get((file["key"][1], owner_line, caller_line, receiver_name), set())
                     if len(scene_targets) == 1:
                         target_classes = list(scene_targets)
                         scene_attached_receiver = True
                     elif len(scene_targets) > 1:
                         _append_script_diagnostic(file["node"], f"Scene node receiver {receiver_name!r} resolves to multiple attached scripts.", int(reference.get("line") or 1))
-                if not target_classes:
+                if not target_classes and not local_receiver_binding:
                     autoload_matches = autoload_scripts_by_name.get((file["project_id"], receiver_name), [])
                     if len(autoload_matches) == 1:
                         target_classes = [str(autoload_matches[0].get("id") or "")]
@@ -857,13 +918,25 @@ def resolve_godot_resources(
                         _append_script_diagnostic(file["node"], f"Autoload receiver {receiver_name!r} is ambiguous in this project.", int(reference.get("line") or 1))
             if not target_classes:
                 continue
-            if receiver_kind == "super":
-                candidates = [find_method(class_id, method_name) for class_id in target_classes]
-                candidates = [candidate for candidate in candidates if candidate]
-            else:
-                candidates = [find_method(class_id, method_name) for class_id in target_classes]
-                candidates = [candidate for candidate in candidates if candidate]
+            resolutions = [find_method_with_reason(class_id, method_name) for class_id in target_classes]
+            candidates = [candidate for candidate, _reason in resolutions if candidate]
             if len(candidates) != 1:
+                if target_classes and receiver_kind in {"identifier", "class", "super"}:
+                    reason = next((reason for _candidate, reason in resolutions if reason), "not_in_project_hierarchy")
+                    if len(target_classes) > 1 or reason in {"ambiguous", "ambiguous_base", "inheritance_cycle"}:
+                        _append_script_diagnostic(
+                            file["node"],
+                            f"Method {method_name!r} on receiver {str(reference.get('receiver') or 'self')!r} is ambiguous in the indexed project hierarchy; no call edge was created.",
+                            int(reference.get("line") or 1),
+                            kind="godot_ambiguous_receiver_method",
+                        )
+                    else:
+                        _append_script_diagnostic(
+                            file["node"],
+                            f"No indexed project method {method_name!r} was found on receiver {str(reference.get('receiver') or 'self')!r}; a Godot or external base method may be outside the indexed project.",
+                            int(reference.get("line") or 1),
+                            kind="godot_receiver_method_not_found",
+                        )
                 continue
             target = candidates[0]
             target_id = str(target.get("id") or "")
@@ -1092,21 +1165,16 @@ def resolve_godot_resources(
                     if len(aliases) == 1:
                         property_owner_ids = [str(aliases[0]["script"].get("id") or "")]
             elif receiver_kind == "identifier":
-                bindings = [
-                    binding for binding in facts.get("receiver_bindings", [])
-                    if isinstance(binding, dict)
-                    and str(binding.get("name") or "") == receiver_name
-                    and str(binding.get("owner_class_line") or "") == str(reference.get("owner_class_line") or "")
-                    and (not binding.get("caller_line") or str(binding.get("caller_line")) == str(reference.get("caller_line")))
-                ]
-                if not bindings:
-                    bindings = [
-                        binding for binding in facts.get("receiver_bindings", [])
-                        if isinstance(binding, dict)
-                        and str(binding.get("name") or "") == receiver_name
-                        and str(binding.get("owner_class_line") or "") == str(reference.get("owner_class_line") or "")
-                        and not binding.get("caller_line")
-                    ]
+                bindings, binding_invalidated, local_receiver_binding = _receiver_bindings_for_reference(
+                    facts, reference, receiver_name
+                )
+                if binding_invalidated:
+                    _append_script_diagnostic(
+                        file["node"],
+                        f"Receiver {receiver_name!r} has no statically safe type after reassignment; its property access was left unresolved.",
+                        int(reference.get("line") or 1),
+                        kind="godot_receiver_type_invalidated",
+                    )
                 type_names = {str(binding.get("type") or "").strip() for binding in bindings}
                 if len(type_names) == 1:
                     type_name = next(iter(type_names))
@@ -1117,11 +1185,11 @@ def resolve_godot_resources(
                         aliases = preload_aliases_by_scope.get((file["key"], owner_line, type_name), [])
                         if len(aliases) == 1:
                             property_owner_ids = [str(aliases[0]["script"].get("id") or "")]
-                if not property_owner_ids:
+                if not property_owner_ids and (not local_receiver_binding or not binding_invalidated):
                     scene_targets = node_receiver_script_targets.get((file["key"][1], owner_line, caller_line, receiver_name), set())
                     if len(scene_targets) == 1:
                         property_owner_ids = list(scene_targets)
-                if not property_owner_ids:
+                if not property_owner_ids and not local_receiver_binding and not binding_invalidated:
                     autoloads = autoload_scripts_by_name.get((file["project_id"], receiver_name), [])
                     if len(autoloads) == 1:
                         property_owner_ids = [str(autoloads[0].get("id") or "")]

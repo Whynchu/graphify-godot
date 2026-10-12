@@ -83,6 +83,35 @@ def test_project_settings_resolve_main_scene_and_autoload_calls(tmp_path: Path):
     assert ("tick", "reset", "godot_gdscript_call") in contexts
 
 
+def test_project_config_header_and_semicolon_comments_are_valid(tmp_path: Path):
+    project = tmp_path / "project.godot"
+    project.write_text(
+        "; Godot project comment\n"
+        "config_version=5\n"
+        "[application]\n"
+        'config/name="Fixture; Name" ; trailing comment\n'
+        'run/main_scene="res://main.tscn"\n',
+        encoding="utf-8",
+    )
+
+    result = extract_godot_project(project, root=tmp_path)
+    facts = result["godot_facts"]
+    assert facts["config_version"] == 5
+    assert facts["main_scene"] == "res://main.tscn"
+    assert not [item for item in facts["diagnostics"] if item["kind"] == "godot_text_parse_error"]
+    project_node = next(node for node in result["nodes"] if node["label"] == "Fixture; Name")
+    assert project_node["metadata"]["godot_kind"] == "godot_project"
+
+    malformed = tmp_path / "malformed_project.godot"
+    malformed.write_text(
+        "unexpected_header=value\n"
+        "[application\n",
+        encoding="utf-8",
+    )
+    malformed_facts = extract_godot_project(malformed, root=tmp_path)["godot_facts"]
+    assert any(item["kind"] == "godot_text_parse_error" for item in malformed_facts["diagnostics"])
+
+
 @_needs_gdscript
 def test_gdscript_node_paths_unique_names_and_attached_receiver_calls(tmp_path: Path):
     _write_project(tmp_path)
